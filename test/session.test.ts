@@ -259,6 +259,148 @@ test("runs and persists a normalized fake Deliberation", async () => {
 	await rm(directory, { recursive: true, force: true });
 });
 
+test("gathers Chair-selected Positions independently as they complete", async () => {
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	const positions = new Map<string, (content: string) => void>();
+	const started: string[] = [];
+	const events: string[] = [];
+	const deliberation = runDeliberation(session, "Should we ship it?", {
+		adapter: {
+			selectParticipants(input) {
+				assert.deepEqual(input.requestedMembers, []);
+				return JSON.stringify({
+					kind: "select-participants",
+					members: ["researcher", "critic"],
+				});
+			},
+			respond({ phase, member, priorContent }) {
+				if (phase !== "position") return `${phase} from ${member.handle}`;
+				started.push(member.handle);
+				assert.deepEqual(priorContent, []);
+				return new Promise((resolve) => positions.set(member.handle, resolve));
+			},
+		},
+		onEvent(event) {
+			if (event.kind === "content" && event.entry.kind === "position") {
+				events.push(event.entry.member);
+			}
+		},
+	});
+
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(started, ["researcher", "critic"]);
+	assert.equal(
+		session.timeline.filter((entry) => entry.kind === "position").length,
+		0,
+	);
+	positions.get("critic")?.("Critic Position");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(events, ["critic"]);
+	positions.get("researcher")?.("Researcher Position");
+	await deliberation;
+
+	assert.deepEqual(
+		session.timeline
+			.filter((entry) => entry.kind === "position")
+			.map((entry) => entry.member),
+		["critic", "researcher"],
+	);
+	assert.doesNotMatch(JSON.stringify(session.timeline), /select-participants/);
+});
+
+test("repairs Chair selection once and honors direct Member Handle mentions", async () => {
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	const controls: string[] = [];
+	await runDeliberation(session, "Could @prototyper build runnable evidence?", {
+		adapter: {
+			selectParticipants(input) {
+				assert.deepEqual(input.requestedMembers, ["prototyper"]);
+				controls.push(input.malformedControl ?? "initial");
+				return input.malformedControl
+					? JSON.stringify({
+							kind: "select-participants",
+							members: ["researcher", "prototyper"],
+						})
+					: "malformed control";
+			},
+			respond({ phase, member }) {
+				return `${phase} from ${member.handle}`;
+			},
+		},
+	});
+
+	assert.equal(controls.length, 2);
+	assert.deepEqual(
+		session.timeline
+			.filter((entry) => entry.kind === "position")
+			.map((entry) => entry.member),
+		["researcher", "prototyper"],
+	);
+	assert.doesNotMatch(JSON.stringify(session.timeline), /malformed control/);
+
+	const invalid = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	let attempts = 0;
+	await assert.rejects(
+		runDeliberation(invalid, "Should we ship it?", {
+			adapter: {
+				selectParticipants() {
+					attempts += 1;
+					return "still malformed";
+				},
+				respond() {
+					return "unused";
+				},
+			},
+		}),
+		/Chair participant selection must be valid JSON/,
+	);
+	assert.equal(attempts, 2);
+	assert.deepEqual(
+		invalid.timeline.map((entry) => entry.kind),
+		["question"],
+	);
+
+	const punctuationCouncil = {
+		...council,
+		members: council.members.map((member) =>
+			member.handle === "researcher"
+				? { ...member, handle: "dev.ops" }
+				: member,
+		),
+	};
+	const punctuation = createSession({
+		council: punctuationCouncil,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	await runDeliberation(punctuation, "Could (@dev.ops) investigate this?", {
+		adapter: {
+			selectParticipants(input) {
+				assert.deepEqual(input.requestedMembers, ["dev.ops"]);
+				return JSON.stringify({
+					kind: "select-participants",
+					members: ["dev.ops", "critic"],
+				});
+			},
+			respond({ phase, member }) {
+				return `${phase} from ${member.handle}`;
+			},
+		},
+	});
+});
+
 test("repairs Session permissions and removes only the selected Session record", async () => {
 	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
 	const session = createSession({

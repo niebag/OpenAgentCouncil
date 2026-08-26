@@ -83,7 +83,10 @@ export type CouncilAdapter = {
 	selectParticipants(input: {
 		chair: SessionMember;
 		members: SessionMember[];
-	}): string[];
+		question: string;
+		requestedMembers: string[];
+		malformedControl?: string;
+	}): string | Promise<string>;
 	respond(request: CouncilRequest): string | Promise<string>;
 };
 
@@ -94,12 +97,16 @@ export const deterministicFakeAdapter: CouncilAdapter = {
 				(member) => member.role === "Researcher" || member.role === "Critic",
 			)
 			.map((member) => member.handle);
-		return selected.length >= 2
-			? selected
-			: members
-					.filter((member) => member.role !== "Chair")
-					.slice(0, 2)
-					.map((member) => member.handle);
+		return JSON.stringify({
+			kind: "select-participants",
+			members:
+				selected.length >= 2
+					? selected
+					: members
+							.filter((member) => member.role !== "Chair")
+							.slice(0, 2)
+							.map((member) => member.handle),
+		});
 	},
 	respond({ phase, member, question }) {
 		const subject = `“${question}”`;
@@ -110,6 +117,60 @@ export const deterministicFakeAdapter: CouncilAdapter = {
 		return `Recommendation for ${subject}.`;
 	},
 };
+
+function requestedMemberHandles(question: string, members: SessionMember[]) {
+	return members
+		.filter(
+			(member) =>
+				member.role !== "Chair" &&
+				new RegExp(
+					`(^|[\\s([{])@${member.handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|[\\s.,!?;:)\\]}])`,
+				).test(question),
+		)
+		.map((member) => member.handle);
+}
+
+function participantHandles(
+	control: string,
+	members: SessionMember[],
+	requestedMembers: string[],
+) {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(control);
+	} catch {
+		throw new Error("Chair participant selection must be valid JSON");
+	}
+	if (
+		!parsed ||
+		typeof parsed !== "object" ||
+		Array.isArray(parsed) ||
+		(parsed as { kind?: unknown }).kind !== "select-participants" ||
+		!Array.isArray((parsed as { members?: unknown }).members)
+	) {
+		throw new Error(
+			"Chair participant selection has an invalid control envelope",
+		);
+	}
+	const handles = (parsed as { members: unknown[] }).members;
+	if (
+		handles.length < 2 ||
+		handles.some(
+			(handle) =>
+				typeof handle !== "string" ||
+				!members.some(
+					(member) => member.handle === handle && member.role !== "Chair",
+				),
+		) ||
+		new Set(handles).size !== handles.length ||
+		requestedMembers.some((handle) => !handles.includes(handle))
+	) {
+		throw new Error(
+			"Chair participant selection must include valid requested Members",
+		);
+	}
+	return handles as string[];
+}
 
 export async function readProfileContents(
 	directory: string,
@@ -216,20 +277,34 @@ export async function runDeliberation(
 		(member) => member.role === "Chair",
 	);
 	if (!chair) throw new Error("Council requires a Chair and Quorum");
-	const participants = [
-		...new Set(
-			adapter.selectParticipants({ chair, members: session.council.members }),
-		),
-	]
-		.map((handle) =>
-			session.council.members.find((member) => member.handle === handle),
-		)
-		.filter(
-			(member): member is SessionMember =>
-				member !== undefined && member.role !== "Chair",
+	const selection = {
+		chair,
+		members: session.council.members,
+		question,
+		requestedMembers: requestedMemberHandles(question, session.council.members),
+	};
+	let control = await adapter.selectParticipants(selection);
+	let handles: string[];
+	try {
+		handles = participantHandles(
+			control,
+			session.council.members,
+			selection.requestedMembers,
 		);
-	if (participants.length < 2)
-		throw new Error("Council requires a Chair and Quorum");
+	} catch {
+		control = await adapter.selectParticipants({
+			...selection,
+			malformedControl: control,
+		});
+		handles = participantHandles(
+			control,
+			session.council.members,
+			selection.requestedMembers,
+		);
+	}
+	const participants = handles.map((handle) =>
+		session.council.members.find((member) => member.handle === handle),
+	) as SessionMember[];
 
 	const positions = await Promise.all(
 		participants.map((member) => complete("position", member, [])),
