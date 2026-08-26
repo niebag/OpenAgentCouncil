@@ -6,25 +6,17 @@
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/openagentcouncil"><picture>
+  <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/npm/openagentcouncil.svg?variant=secondary&amp;size=sm&amp;mode=dark" />
     <img src="https://shieldcn.dev/npm/openagentcouncil.svg?variant=secondary&amp;size=sm&amp;mode=light" alt="OpenAgentCouncil npm package version" />
-  </picture></a>
-  <a href="https://github.com/niebag/OpenAgentCouncil/actions/workflows/ci.yml"><picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/niebag/OpenAgentCouncil.svg?workflow=CI&amp;branch=main&amp;variant=secondary&amp;size=sm&amp;mode=dark" />
-    <img src="https://shieldcn.dev/github/ci/niebag/OpenAgentCouncil.svg?workflow=CI&amp;branch=main&amp;variant=secondary&amp;size=sm&amp;mode=light" alt="CI workflow status" />
-  </picture></a>
-  <a href="LICENSE"><picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/license-MIT.svg?variant=secondary&amp;size=sm&amp;logo=opensourceinitiative&amp;mode=dark" />
-    <img src="https://shieldcn.dev/badge/license-MIT.svg?variant=secondary&amp;size=sm&amp;logo=opensourceinitiative&amp;mode=light" alt="Project source license: MIT" />
-  </picture></a>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/Node-24.svg?variant=secondary&amp;size=sm&amp;logo=nodedotjs&amp;mode=dark" />
-    <img src="https://shieldcn.dev/badge/Node-24.svg?variant=secondary&amp;size=sm&amp;logo=nodedotjs&amp;mode=light" alt="Required runtime: Node 24" />
   </picture>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/macOS+%7C+Linux-supported.svg?variant=secondary&amp;size=sm&amp;mode=dark" />
-    <img src="https://shieldcn.dev/badge/macOS+%7C+Linux-supported.svg?variant=secondary&amp;size=sm&amp;mode=light" alt="Supported platforms: macOS and Linux" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/niebag/OpenAgentCouncil.svg?workflow=ci.yml&amp;branch=main&amp;variant=secondary&amp;size=sm&amp;mode=dark" />
+    <img src="https://shieldcn.dev/github/ci/niebag/OpenAgentCouncil.svg?workflow=ci.yml&amp;branch=main&amp;variant=secondary&amp;size=sm&amp;mode=light" alt="CI workflow status" />
+  </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/license-MIT.svg?variant=secondary&amp;size=sm&amp;logo=opensourceinitiative&amp;mode=dark" />
+    <img src="https://shieldcn.dev/badge/license-MIT.svg?variant=secondary&amp;size=sm&amp;logo=opensourceinitiative&amp;mode=light" alt="Project source license: MIT" />
   </picture>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/Codex-supported.svg?variant=secondary&amp;size=sm&amp;mode=dark" />
