@@ -223,6 +223,7 @@ test("runs and persists a normalized fake Deliberation", async () => {
 			"position",
 			"draft-recommendation",
 			"review",
+			"review",
 			"recommendation",
 		],
 	);
@@ -277,6 +278,7 @@ test("gathers Chair-selected Positions independently as they complete", async ()
 					members: ["researcher", "critic"],
 				});
 			},
+			control: deterministicFakeAdapter.control,
 			respond({ phase, member, priorContent }) {
 				if (phase !== "position") return `${phase} from ${member.handle}`;
 				started.push(member.handle);
@@ -331,6 +333,7 @@ test("repairs Chair selection once and honors direct Member Handle mentions", as
 						})
 					: "malformed control";
 			},
+			control: deterministicFakeAdapter.control,
 			respond({ phase, member }) {
 				return `${phase} from ${member.handle}`;
 			},
@@ -359,6 +362,7 @@ test("repairs Chair selection once and honors direct Member Handle mentions", as
 					attempts += 1;
 					return "still malformed";
 				},
+				control: deterministicFakeAdapter.control,
 				respond() {
 					return "unused";
 				},
@@ -394,11 +398,436 @@ test("repairs Chair selection once and honors direct Member Handle mentions", as
 					members: ["dev.ops", "critic"],
 				});
 			},
+			control: deterministicFakeAdapter.control,
 			respond({ phase, member }) {
 				return `${phase} from ${member.handle}`;
 			},
 		},
 	});
+});
+
+test("finalizes a reviewed Recommendation after bounded open Rounds", async () => {
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	let round = 0;
+	const recommendation = [
+		"## Synthesis",
+		"Ship the smaller change.",
+		"## Reasoning",
+		"The evidence supports it.",
+		"## Uncertainty",
+		"Production load remains unknown.",
+		"## Sources",
+		"- https://example.com/research",
+		"## Dissent",
+		"@critic: wait for load data.",
+	].join("\n");
+
+	await runDeliberation(session, "Should we ship it?", {
+		adapter: {
+			selectParticipants() {
+				return JSON.stringify({
+					kind: "select-participants",
+					members: ["researcher", "critic", "prototyper"],
+				});
+			},
+			control({ phase, priorContent }) {
+				if (phase === "finalization") {
+					assert.ok(priorContent.some((content) => content.includes("review")));
+					return JSON.stringify({ kind: "finalize-recommendation" });
+				}
+				round += 1;
+				return JSON.stringify(
+					round === 1
+						? { kind: "open-round", members: ["researcher", "critic"] }
+						: { kind: "draft-recommendation" },
+				);
+			},
+			respond({ phase, member, priorContent }) {
+				if (phase === "position" && member.handle === "prototyper") {
+					throw new Error("provider unavailable");
+				}
+				if (phase === "round") {
+					assert.ok(
+						priorContent.some((content) => content.includes("position")),
+					);
+				}
+				if (phase === "review") {
+					return member.handle === "critic"
+						? "Material Dissent: wait for load data."
+						: "No material Dissent.";
+				}
+				if (phase === "recommendation") return recommendation;
+				return `${phase} from ${member.handle}`;
+			},
+		},
+	});
+
+	assert.deepEqual(session.deliberations[0]?.outcome, {
+		kind: "recommendation",
+	});
+	assert.equal(
+		session.timeline.filter((entry) => entry.kind === "round").length,
+		2,
+	);
+	assert.equal(
+		session.timeline.filter((entry) => entry.kind === "review").length,
+		3,
+	);
+	assert.ok(
+		session.timeline.some(
+			(entry) =>
+				entry.kind === "member-failure" && entry.member === "prototyper",
+		),
+	);
+	assert.equal(session.timeline.at(-1)?.content, recommendation);
+});
+
+test("enforces finite Round and provider-call budgets", async () => {
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	let calls = 0;
+	await runDeliberation(session, "Keep discussing?", {
+		adapter: {
+			selectParticipants() {
+				calls += 1;
+				return JSON.stringify({
+					kind: "select-participants",
+					members: ["researcher", "critic", "prototyper"],
+				});
+			},
+			control({ phase }) {
+				calls += 1;
+				return JSON.stringify(
+					phase === "round"
+						? {
+								kind: "open-round",
+								members: ["researcher", "critic", "prototyper"],
+							}
+						: { kind: "finalize-recommendation" },
+				);
+			},
+			respond(request) {
+				calls += 1;
+				return deterministicFakeAdapter.respond(request);
+			},
+		},
+	});
+
+	assert.equal(
+		session.timeline.filter((entry) => entry.kind === "round").length,
+		6,
+	);
+	assert.ok(calls <= 20);
+	assert.deepEqual(session.deliberations[0]?.outcome, {
+		kind: "recommendation",
+	});
+
+	const largeCouncil = {
+		name: "Large Council",
+		members: [
+			council.members[0] as (typeof council.members)[number],
+			...Array.from({ length: 25 }, (_, index) => ({
+				handle: `member-${index}`,
+				role: "Analyst",
+				provider: "codex" as const,
+				profile: `member-${index}.md`,
+			})),
+		],
+	};
+	const exhausted = createSession({
+		council: largeCouncil,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	let providerCalls = 0;
+	await runDeliberation(exhausted, "Can everyone respond?", {
+		adapter: {
+			selectParticipants({ members }) {
+				providerCalls += 1;
+				return JSON.stringify({
+					kind: "select-participants",
+					members: members
+						.filter((member) => member.role !== "Chair")
+						.map((member) => member.handle),
+				});
+			},
+			control() {
+				providerCalls += 1;
+				return JSON.stringify({ kind: "draft-recommendation" });
+			},
+			respond({ phase, member }) {
+				providerCalls += 1;
+				return `${phase} from ${member.handle}`;
+			},
+		},
+	});
+
+	assert.equal(providerCalls, 20);
+	assert.match(
+		exhausted.timeline.at(-1)?.content ?? "",
+		/provider-call budget exhausted/,
+	);
+});
+
+test("persists incomplete outcomes without relabeling partial work", async () => {
+	const noQuorum = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	await runDeliberation(noQuorum, "Can we decide?", {
+		adapter: {
+			selectParticipants() {
+				return JSON.stringify({
+					kind: "select-participants",
+					members: ["researcher", "critic"],
+				});
+			},
+			control: deterministicFakeAdapter.control,
+			respond({ phase, member }) {
+				if (phase === "position" && member.handle === "critic") {
+					throw new Error("critic unavailable");
+				}
+				return `${phase} from ${member.handle}`;
+			},
+		},
+	});
+
+	assert.deepEqual(noQuorum.deliberations[0]?.outcome, {
+		kind: "incomplete-deliberation",
+		reason: "missing-quorum",
+	});
+	assert.deepEqual(
+		noQuorum.timeline.map((entry) => entry.kind),
+		["question", "position", "member-failure", "incomplete-deliberation"],
+	);
+
+	const noReview = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	await runDeliberation(noReview, "Can we decide?", {
+		adapter: {
+			selectParticipants() {
+				return JSON.stringify({
+					kind: "select-participants",
+					members: ["researcher", "critic"],
+				});
+			},
+			control: deterministicFakeAdapter.control,
+			respond({ phase, member }) {
+				if (phase === "review") throw new Error("review unavailable");
+				return `${phase} from ${member.handle}`;
+			},
+		},
+	});
+
+	assert.deepEqual(noReview.deliberations[0]?.outcome, {
+		kind: "incomplete-deliberation",
+		reason: "missing-review",
+	});
+	assert.equal(
+		noReview.timeline.filter((entry) => entry.kind === "recommendation").length,
+		0,
+	);
+	assert.equal(noReview.timeline.at(-1)?.kind, "incomplete-deliberation");
+	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
+	await saveSession(directory, noReview);
+	assert.deepEqual(
+		(await loadSession(directory, noReview.id)).deliberations[0]?.outcome,
+		noReview.deliberations[0]?.outcome,
+	);
+	await rm(directory, { recursive: true, force: true });
+});
+
+test("repairs malformed Round and finalization control once", async () => {
+	for (const malformedPhase of ["round", "finalization"] as const) {
+		const session = createSession({
+			council,
+			workingDirectory: "/tmp/workspace",
+			profileContents: {},
+		});
+		let attempts = 0;
+		await runDeliberation(session, "Can the Chair finish?", {
+			adapter: {
+				selectParticipants() {
+					return JSON.stringify({
+						kind: "select-participants",
+						members: ["researcher", "critic"],
+					});
+				},
+				control(input) {
+					if (input.phase === malformedPhase) {
+						attempts += 1;
+						if (attempts === 2) {
+							assert.equal(input.malformedControl, "malformed");
+							assert.match(input.validationError ?? "", /Chair/);
+						}
+						return "malformed";
+					}
+					return JSON.stringify(
+						input.phase === "round"
+							? { kind: "draft-recommendation" }
+							: { kind: "finalize-recommendation" },
+					);
+				},
+				respond({ phase, member }) {
+					return `${phase} from ${member.handle}`;
+				},
+			},
+		});
+
+		assert.equal(attempts, 2);
+		assert.deepEqual(session.deliberations[0]?.outcome, {
+			kind: "incomplete-deliberation",
+			reason: "chair-failure",
+		});
+		assert.equal(
+			session.timeline.filter((entry) => entry.kind === "recommendation")
+				.length,
+			0,
+		);
+		assert.match(session.timeline.at(-1)?.content ?? "", /Chair/);
+	}
+});
+
+test("rejects empty contributions and incomplete Recommendation content", async () => {
+	const emptyPosition = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	await runDeliberation(emptyPosition, "Can empty output count?", {
+		adapter: {
+			selectParticipants() {
+				return JSON.stringify({
+					kind: "select-participants",
+					members: ["researcher", "critic"],
+				});
+			},
+			control: deterministicFakeAdapter.control,
+			respond({ phase, member }) {
+				return phase === "position" && member.handle === "critic"
+					? ""
+					: `${phase} from ${member.handle}`;
+			},
+		},
+	});
+
+	assert.deepEqual(emptyPosition.deliberations[0]?.outcome, {
+		kind: "incomplete-deliberation",
+		reason: "missing-quorum",
+	});
+	assert.match(
+		emptyPosition.timeline.find((entry) => entry.kind === "member-failure")
+			?.content ?? "",
+		/content must be non-empty/,
+	);
+
+	const invalidRecommendation = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	await runDeliberation(invalidRecommendation, "Can a partial answer pass?", {
+		adapter: {
+			selectParticipants() {
+				return JSON.stringify({
+					kind: "select-participants",
+					members: ["researcher", "critic"],
+				});
+			},
+			control: deterministicFakeAdapter.control,
+			respond({ phase, member }) {
+				return phase === "recommendation"
+					? "Ship it."
+					: `${phase} from ${member.handle}`;
+			},
+		},
+	});
+
+	assert.deepEqual(invalidRecommendation.deliberations[0]?.outcome, {
+		kind: "incomplete-deliberation",
+		reason: "chair-failure",
+	});
+	assert.equal(
+		invalidRecommendation.timeline.filter(
+			(entry) => entry.kind === "recommendation",
+		).length,
+		0,
+	);
+	assert.match(
+		invalidRecommendation.timeline.at(-1)?.content ?? "",
+		/Recommendation must include a Synthesis section/,
+	);
+});
+
+test("does not let a Recommendation drop research claims or Dissent", async () => {
+	const omission = [
+		"## Synthesis",
+		"Ship it.",
+		"## Reasoning",
+		"The Council reviewed it.",
+		"## Uncertainty",
+		"Some uncertainty remains.",
+		"## Sources",
+		"No research claims.",
+		"## Dissent",
+		"No material Dissent.",
+	].join("\n");
+	for (const [kind, expectedError] of [
+		["research", /Sources must include a concrete URL/],
+		["dissent", /Dissent must include @critic's review/],
+	] as const) {
+		const session = createSession({
+			council,
+			workingDirectory: "/tmp/workspace",
+			profileContents: {},
+		});
+		await runDeliberation(session, "Can evidence be omitted?", {
+			adapter: {
+				selectParticipants() {
+					return JSON.stringify({
+						kind: "select-participants",
+						members: ["researcher", "critic"],
+					});
+				},
+				control: deterministicFakeAdapter.control,
+				respond({ phase, member }) {
+					if (phase === "recommendation") return omission;
+					if (phase === "position") {
+						return kind === "research" && member.handle === "researcher"
+							? "Conversion increased by 20%."
+							: "No research claims.";
+					}
+					if (phase === "review") {
+						return kind === "dissent" && member.handle === "critic"
+							? "Do not ship before load testing."
+							: "No material Dissent.";
+					}
+					return `${phase} from ${member.handle}`;
+				},
+			},
+		});
+
+		assert.deepEqual(session.deliberations[0]?.outcome, {
+			kind: "incomplete-deliberation",
+			reason: "chair-failure",
+		});
+		assert.equal(
+			session.timeline.some((entry) => entry.kind === "recommendation"),
+			false,
+		);
+		assert.match(session.timeline.at(-1)?.content ?? "", expectedError);
+	}
 });
 
 test("repairs Session permissions and removes only the selected Session record", async () => {

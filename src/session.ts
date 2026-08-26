@@ -14,6 +14,23 @@ import type { Council, Member } from "./configuration.js";
 
 type SessionMember = Member & { profileContent: string };
 
+type CouncilPhase =
+	| "position"
+	| "round"
+	| "draft-recommendation"
+	| "review"
+	| "recommendation";
+
+type ContributionEntry = {
+	[Kind in CouncilPhase]: {
+		kind: Kind;
+		deliberationId: string;
+		member: string;
+		content: string;
+		createdAt: string;
+	};
+}[CouncilPhase];
+
 export type TimelineEntry =
 	| {
 			kind: "question";
@@ -21,40 +38,35 @@ export type TimelineEntry =
 			content: string;
 			createdAt: string;
 	  }
+	| ContributionEntry
 	| {
-			kind: "position";
+			kind: "member-failure";
 			deliberationId: string;
 			member: string;
+			phase: CouncilPhase;
 			content: string;
 			createdAt: string;
 	  }
 	| {
-			kind: "draft-recommendation";
+			kind: "incomplete-deliberation";
 			deliberationId: string;
 			member: string;
-			content: string;
-			createdAt: string;
-	  }
-	| {
-			kind: "review";
-			deliberationId: string;
-			member: string;
-			content: string;
-			createdAt: string;
-	  }
-	| {
-			kind: "recommendation";
-			deliberationId: string;
-			member: string;
+			reason: IncompleteReason;
 			content: string;
 			createdAt: string;
 	  };
+type IncompleteReason = "missing-quorum" | "missing-review" | "chair-failure";
+
+export type DeliberationOutcome =
+	| { kind: "recommendation" }
+	| { kind: "incomplete-deliberation"; reason: IncompleteReason };
 
 export type Deliberation = {
 	id: string;
 	question: string;
 	startedAt: string;
 	completedAt?: string;
+	outcome?: DeliberationOutcome;
 	providerSessionReferences: Record<string, string>;
 };
 
@@ -69,14 +81,29 @@ export type Session = {
 };
 
 export type RuntimeEvent =
-	| { kind: "member-status"; member: string; status: "working" | "completed" }
+	| {
+			kind: "member-status";
+			member: string;
+			status: "working" | "completed" | "failed";
+	  }
 	| { kind: "content"; entry: Exclude<TimelineEntry, { kind: "question" }> };
 
 type CouncilRequest = {
-	phase: "position" | "draft-recommendation" | "review" | "recommendation";
+	phase: CouncilPhase;
 	member: SessionMember;
 	question: string;
 	priorContent: string[];
+};
+
+type CouncilControlRequest = {
+	phase: "round" | "finalization";
+	chair: SessionMember;
+	members: SessionMember[];
+	question: string;
+	round: number;
+	priorContent: string[];
+	malformedControl?: string;
+	validationError?: string;
 };
 
 export type CouncilAdapter = {
@@ -87,8 +114,11 @@ export type CouncilAdapter = {
 		requestedMembers: string[];
 		malformedControl?: string;
 	}): string | Promise<string>;
+	control(request: CouncilControlRequest): string | Promise<string>;
 	respond(request: CouncilRequest): string | Promise<string>;
 };
+
+const deliberationBudget = { openRounds: 2, providerCalls: 20 } as const;
 
 export const deterministicFakeAdapter: CouncilAdapter = {
 	selectParticipants({ members }) {
@@ -108,13 +138,34 @@ export const deterministicFakeAdapter: CouncilAdapter = {
 							.map((member) => member.handle),
 		});
 	},
+	control({ phase }) {
+		return JSON.stringify({
+			kind:
+				phase === "round" ? "draft-recommendation" : "finalize-recommendation",
+		});
+	},
 	respond({ phase, member, question }) {
 		const subject = `“${question}”`;
-		if (phase === "position") return `${member.role} Position on ${subject}.`;
+		if (phase === "position")
+			return `${member.role} Position on ${subject}. No research claims.`;
+		if (phase === "round")
+			return `${member.role} Round on ${subject}. No research claims.`;
 		if (phase === "draft-recommendation")
 			return `Draft Recommendation for ${subject}.`;
-		if (phase === "review") return `Review completed for ${subject}.`;
-		return `Recommendation for ${subject}.`;
+		if (phase === "review")
+			return `Review completed for ${subject}. No material Dissent.`;
+		return [
+			"## Synthesis",
+			`Recommendation for ${subject}.`,
+			"## Reasoning",
+			"The completed Positions and reviews support this synthesis.",
+			"## Uncertainty",
+			"The deterministic adapter provides no external evidence.",
+			"## Sources",
+			"No research claims.",
+			"## Dissent",
+			"No material Dissent.",
+		].join("\n");
 	},
 };
 
@@ -170,6 +221,142 @@ function participantHandles(
 		);
 	}
 	return handles as string[];
+}
+
+function roundControl(control: string, participants: SessionMember[]) {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(control);
+	} catch {
+		throw new Error("Chair Round control must be valid JSON");
+	}
+	if (
+		parsed &&
+		typeof parsed === "object" &&
+		!Array.isArray(parsed) &&
+		(parsed as { kind?: unknown }).kind === "draft-recommendation"
+	) {
+		return [];
+	}
+	const members = (parsed as { kind?: unknown; members?: unknown })?.members;
+	if (
+		!parsed ||
+		typeof parsed !== "object" ||
+		Array.isArray(parsed) ||
+		(parsed as { kind?: unknown }).kind !== "open-round" ||
+		!Array.isArray(members) ||
+		members.length === 0 ||
+		members.some(
+			(handle) =>
+				typeof handle !== "string" ||
+				!participants.some((member) => member.handle === handle),
+		) ||
+		new Set(members).size !== members.length
+	) {
+		throw new Error("Chair Round control must select participating Members");
+	}
+	return members as string[];
+}
+
+function finalizationControl(control: string) {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(control);
+	} catch {
+		throw new Error("Chair finalization control must be valid JSON");
+	}
+	if (
+		!parsed ||
+		typeof parsed !== "object" ||
+		Array.isArray(parsed) ||
+		(parsed as { kind?: unknown }).kind !== "finalize-recommendation"
+	) {
+		throw new Error(
+			"Chair finalization control must finalize the Recommendation",
+		);
+	}
+}
+
+function validateRecommendation(
+	content: string,
+	participants: SessionMember[],
+	contributions: ContributionEntry[],
+) {
+	const names = [
+		"Synthesis",
+		"Reasoning",
+		"Uncertainty",
+		"Sources",
+		"Dissent",
+	] as const;
+	const sections = Object.fromEntries(
+		names.map((name) => {
+			const match = content.match(
+				new RegExp(
+					`^#{1,6}\\s+${name}\\s*$\\n([\\s\\S]*?)(?=^#{1,6}\\s+(?:${names.join("|")})\\s*$|(?![\\s\\S]))`,
+					"im",
+				),
+			);
+			if (!match?.[1]?.trim()) {
+				throw new Error(`Recommendation must include a ${name} section`);
+			}
+			return [name, match[1]];
+		}),
+	) as Record<(typeof names)[number], string>;
+	if (
+		!/https?:\/\/\S+/i.test(sections.Sources) &&
+		(!/no research claims/i.test(sections.Sources) ||
+			contributions.some((entry) => {
+				const member = participants.find(
+					(participant) => participant.handle === entry.member,
+				);
+				return (
+					(entry.kind === "position" || entry.kind === "round") &&
+					(member?.role === "Researcher" ||
+						member?.capabilities?.includes("web")) &&
+					!/no research claims/i.test(entry.content)
+				);
+			}))
+	) {
+		throw new Error(
+			"Recommendation Sources must include a concrete URL or state that there are no research claims",
+		);
+	}
+	for (const url of contributions.flatMap(
+		(entry) => entry.content.match(/https?:\/\/\S+/gi) ?? [],
+	)) {
+		if (!sections.Sources.includes(url)) {
+			throw new Error("Recommendation Sources must preserve contribution URLs");
+		}
+	}
+	if (
+		!/no material dissent/i.test(sections.Dissent) &&
+		!participants.some((member) =>
+			new RegExp(
+				`@${member.handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*:`,
+				"i",
+			).test(sections.Dissent),
+		)
+	) {
+		throw new Error(
+			"Recommendation Dissent must be attributed to a participating Member",
+		);
+	}
+	for (const review of contributions.filter(
+		(entry) => entry.kind === "review",
+	)) {
+		if (
+			!/no material dissent/i.test(review.content) &&
+			!new RegExp(
+				`@${review.member.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*:`,
+				"i",
+			).test(sections.Dissent)
+		) {
+			throw new Error(
+				`Recommendation Dissent must include @${review.member}'s review`,
+			);
+		}
+	}
 }
 
 export async function readProfileContents(
@@ -249,41 +436,130 @@ export async function runDeliberation(
 		events.push(event);
 		onEvent?.(event);
 	};
-	const complete = async (
-		kind: Exclude<TimelineEntry["kind"], "question">,
-		member: SessionMember,
-		priorContent: string[],
-	) => {
-		emit({ kind: "member-status", member: member.handle, status: "working" });
-		const entry = {
-			kind,
-			deliberationId: deliberation.id,
-			member: member.handle,
-			content: await adapter.respond({
-				phase: kind,
-				member,
-				question,
-				priorContent,
-			}),
-			createdAt: now(),
-		} as Exclude<TimelineEntry, { kind: "question" }>;
-		session.timeline.push(entry);
-		emit({ kind: "content", entry });
-		emit({ kind: "member-status", member: member.handle, status: "completed" });
-		return entry;
-	};
-
 	const chair = session.council.members.find(
 		(member) => member.role === "Chair",
 	);
 	if (!chair) throw new Error("Council requires a Chair and Quorum");
+	let providerCalls = 0;
+	const call = async <T>(operation: () => T | Promise<T>): Promise<T> => {
+		if (providerCalls >= deliberationBudget.providerCalls) {
+			throw new Error("Deliberation provider-call budget exhausted");
+		}
+		providerCalls += 1;
+		return operation();
+	};
+	const contributions = () =>
+		session.timeline.filter(
+			(entry): entry is ContributionEntry =>
+				entry.deliberationId === deliberation.id &&
+				(entry.kind === "position" ||
+					entry.kind === "round" ||
+					entry.kind === "draft-recommendation" ||
+					entry.kind === "review" ||
+					entry.kind === "recommendation"),
+		);
+	const visibleContent = () =>
+		contributions().map(
+			(entry) => `@${entry.member} (${entry.kind}):\n${entry.content}`,
+		);
+	const collectContribution = async (
+		kind: CouncilPhase,
+		member: SessionMember,
+		priorContent: string[],
+		validate?: (content: string) => void,
+	) => {
+		emit({ kind: "member-status", member: member.handle, status: "working" });
+		try {
+			const content = await call(() =>
+				adapter.respond({ phase: kind, member, question, priorContent }),
+			);
+			if (content.trim().length === 0) {
+				throw new Error(`${kind} content must be non-empty`);
+			}
+			validate?.(content);
+			const entry = {
+				kind,
+				deliberationId: deliberation.id,
+				member: member.handle,
+				content,
+				createdAt: now(),
+			} as Extract<TimelineEntry, { kind: CouncilPhase }>;
+			session.timeline.push(entry);
+			emit({ kind: "content", entry });
+			emit({
+				kind: "member-status",
+				member: member.handle,
+				status: "completed",
+			});
+			return entry;
+		} catch (error) {
+			const entry: Extract<TimelineEntry, { kind: "member-failure" }> = {
+				kind: "member-failure",
+				deliberationId: deliberation.id,
+				member: member.handle,
+				phase: kind,
+				content: `${member.handle} failed during ${kind}: ${error instanceof Error ? error.message : "unknown error"}`,
+				createdAt: now(),
+			};
+			session.timeline.push(entry);
+			emit({ kind: "content", entry });
+			emit({ kind: "member-status", member: member.handle, status: "failed" });
+			throw error;
+		}
+	};
+	const incomplete = (reason: IncompleteReason, detail: string) => {
+		const entry: Extract<TimelineEntry, { kind: "incomplete-deliberation" }> = {
+			kind: "incomplete-deliberation",
+			deliberationId: deliberation.id,
+			member: chair.handle,
+			reason,
+			content: `Incomplete Deliberation: ${detail}`,
+			createdAt: now(),
+		};
+		deliberation.outcome = { kind: "incomplete-deliberation", reason };
+		deliberation.completedAt = now();
+		session.timeline.push(entry);
+		emit({ kind: "content", entry });
+		return events;
+	};
+	const getControl = async <Result>(
+		phase: CouncilControlRequest["phase"],
+		round: number,
+		parse: (control: string) => Result,
+	) => {
+		let malformedControl: string | undefined;
+		let validationError: string | undefined;
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			const control = await call(() =>
+				adapter.control({
+					phase,
+					chair,
+					members: session.council.members,
+					question,
+					round,
+					priorContent: visibleContent(),
+					malformedControl,
+					validationError,
+				}),
+			);
+			try {
+				return parse(control);
+			} catch (error) {
+				if (attempt === 1) throw error;
+				malformedControl = control as string;
+				validationError =
+					error instanceof Error ? error.message : "invalid Chair control";
+			}
+		}
+		throw new Error("Chair control repair failed");
+	};
 	const selection = {
 		chair,
 		members: session.council.members,
 		question,
 		requestedMembers: requestedMemberHandles(question, session.council.members),
 	};
-	let control = await adapter.selectParticipants(selection);
+	let control = await call(() => adapter.selectParticipants(selection));
 	let handles: string[];
 	try {
 		handles = participantHandles(
@@ -292,10 +568,12 @@ export async function runDeliberation(
 			selection.requestedMembers,
 		);
 	} catch {
-		control = await adapter.selectParticipants({
-			...selection,
-			malformedControl: control,
-		});
+		control = await call(() =>
+			adapter.selectParticipants({
+				...selection,
+				malformedControl: control,
+			}),
+		);
 		handles = participantHandles(
 			control,
 			session.council.members,
@@ -306,16 +584,89 @@ export async function runDeliberation(
 		session.council.members.find((member) => member.handle === handle),
 	) as SessionMember[];
 
-	const positions = await Promise.all(
-		participants.map((member) => complete("position", member, [])),
+	const positionResults = await Promise.allSettled(
+		participants.map((member) => collectContribution("position", member, [])),
 	);
-	const draft = await complete(
-		"draft-recommendation",
-		chair,
-		positions.map((position) => position.content),
+	const positions = positionResults.flatMap((result) =>
+		result.status === "fulfilled" ? [result.value] : [],
 	);
-	const review = await complete("review", participants[0], [draft.content]);
-	await complete("recommendation", chair, [draft.content, review.content]);
+	if (new Set(positions.map((position) => position.member)).size < 2) {
+		return incomplete(
+			"missing-quorum",
+			"Quorum requires two completed Positions",
+		);
+	}
+
+	try {
+		for (let round = 1; round <= deliberationBudget.openRounds; round += 1) {
+			const roundMembers = await getControl("round", round, (value) =>
+				roundControl(value, participants),
+			);
+			if (roundMembers.length === 0) break;
+			const priorContent = visibleContent();
+			await Promise.allSettled(
+				roundMembers.map((handle) =>
+					collectContribution(
+						"round",
+						participants.find(
+							(member) => member.handle === handle,
+						) as SessionMember,
+						priorContent,
+					),
+				),
+			);
+		}
+	} catch (error) {
+		emit({ kind: "member-status", member: chair.handle, status: "failed" });
+		return incomplete(
+			"chair-failure",
+			error instanceof Error ? error.message : "Chair Round control failed",
+		);
+	}
+
+	let draft: Extract<TimelineEntry, { kind: CouncilPhase }>;
+	try {
+		draft = await collectContribution(
+			"draft-recommendation",
+			chair,
+			visibleContent(),
+		);
+	} catch (error) {
+		return incomplete(
+			"chair-failure",
+			error instanceof Error ? error.message : "Chair draft failed",
+		);
+	}
+	const reviewResults = await Promise.allSettled(
+		participants.map((member) =>
+			collectContribution("review", member, [draft.content]),
+		),
+	);
+	const reviews = reviewResults.flatMap((result) =>
+		result.status === "fulfilled" ? [result.value] : [],
+	);
+	if (reviews.length === 0) {
+		return incomplete(
+			"missing-review",
+			"at least one completed Review Round response is required",
+		);
+	}
+	try {
+		await getControl("finalization", 1, finalizationControl);
+		await collectContribution(
+			"recommendation",
+			chair,
+			visibleContent(),
+			(content) =>
+				validateRecommendation(content, participants, contributions()),
+		);
+	} catch (error) {
+		return incomplete(
+			"chair-failure",
+			error instanceof Error ? error.message : "Chair finalization failed",
+		);
+	}
+	deliberation.outcome = { kind: "recommendation" };
 	deliberation.completedAt = now();
 	return events;
 }

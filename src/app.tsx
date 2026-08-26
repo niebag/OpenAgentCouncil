@@ -38,7 +38,7 @@ function Roster({
 	statuses,
 }: {
 	members: Member[];
-	statuses: Record<string, "waiting" | "working" | "completed">;
+	statuses: Record<string, "waiting" | "working" | "completed" | "failed">;
 }) {
 	return (
 		<Box
@@ -106,7 +106,7 @@ function CouncilScreen({
 	const [error, setError] = useState<string>();
 	const [notice, setNotice] = useState<string>();
 	const [statuses, setStatuses] = useState<
-		Record<string, "waiting" | "working" | "completed">
+		Record<string, "waiting" | "working" | "completed" | "failed">
 	>({});
 	const textareaRef = useRef<TextAreaHandle>(null);
 	const narrow = columns < 72;
@@ -362,7 +362,7 @@ function CouncilScreen({
 						.filter((entry) => entry.kind !== "question")
 						.map((entry) => (
 							<Text
-								key={`${entry.deliberationId}-${entry.kind}-${"member" in entry ? entry.member : ""}`}
+								key={`${entry.deliberationId}-${entry.kind}-${"member" in entry ? entry.member : ""}-${entry.createdAt}-${entry.content}`}
 							>
 								{entry.kind}: {entry.content}
 							</Text>
