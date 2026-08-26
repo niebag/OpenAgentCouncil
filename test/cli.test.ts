@@ -67,9 +67,17 @@ test("the built entrypoint restores its terminal on SIGTERM", async () => {
 			],
 			{
 				cwd: root,
-				env: { ...process.env, HOME: directory, PATH: "" },
+				env: {
+					...process.env,
+					HOME: directory,
+					PATH: "",
+					OPENAGENTCOUNCIL_TTY_HOLD: "1",
+				},
 				stdio: ["pipe", "pipe", "pipe"],
 			},
+		);
+		const closed = new Promise<number | null>((resolve) =>
+			child.once("close", resolve),
 		);
 		let output = "";
 		child.stdout.on("data", (chunk) => {
@@ -87,10 +95,7 @@ test("the built entrypoint restores its terminal on SIGTERM", async () => {
 			});
 		});
 		child.kill("SIGTERM");
-		const code = await new Promise<number | null>((resolve) =>
-			child.once("close", resolve),
-		);
-		assert.equal(code, 143);
+		assert.equal(await closed, 143);
 		assert.ok(output.includes(`${String.fromCharCode(27)}[?25h`));
 	} finally {
 		await rm(directory, { recursive: true, force: true });

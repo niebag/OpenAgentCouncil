@@ -26,6 +26,10 @@ import path from "node:path";
 const directory = path.dirname(process.argv[1]);
 const mode = readFileSync(path.join(directory, "mode"), "utf8").trim();
 const log = (value) => appendFileSync(path.join(directory, "fixture.log"), JSON.stringify(value) + "\\n");
+process.on("SIGTERM", () => {
+  log({ signal: "SIGTERM" });
+  if (mode !== "ignore-term") process.exit(0);
+});
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const args = process.argv.slice(2);
 const valueAfter = (flag) => {
@@ -84,10 +88,6 @@ if (mode === "malformed") {
 	  send({ type: "result", subtype: "success", is_error: false, session_id: sessionId, result: content });
 }
 
-process.on("SIGTERM", () => {
-  log({ signal: "SIGTERM" });
-  if (mode !== "ignore-term") process.exit(0);
-});
 `;
 
 async function fixture(mode = "normal") {
@@ -447,7 +447,12 @@ test("cancels and force-terminates unresponsive Claude processes", async () => {
 					onPartial() {},
 				}),
 			);
-			await new Promise((resolve) => setTimeout(resolve, 100));
+			const deadline = Date.now() + 2_000;
+			while ((await server.messages()).length === 0) {
+				if (Date.now() >= deadline)
+					throw new Error("Claude fixture did not start");
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
 			controller.abort();
 			await assert.rejects(
 				response,

@@ -4,15 +4,21 @@ const ownsProcessGroup = process.platform !== "win32";
 const wait = (milliseconds: number) =>
 	new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+function exited(child: ChildProcessWithoutNullStreams) {
+	return child.exitCode !== null || child.signalCode !== null;
+}
+
 function running(child: ChildProcessWithoutNullStreams) {
 	if (child.pid === undefined) return false;
 	if (!ownsProcessGroup)
-		return child.exitCode === null && child.signalCode === null;
+		return !exited(child);
 	try {
 		process.kill(-child.pid, 0);
 		return true;
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ESRCH" || exited(child)) return false;
+		if (code === "EPERM") return true;
 		throw error;
 	}
 }
@@ -23,7 +29,9 @@ function signal(child: ChildProcessWithoutNullStreams, value: NodeJS.Signals) {
 			process.kill(-child.pid, value);
 			return;
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ESRCH" || exited(child)) return;
+			if (code !== "EPERM") throw error;
 		}
 	}
 	child.kill(value);

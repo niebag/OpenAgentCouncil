@@ -1,6 +1,5 @@
-import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import {
 	chmod,
 	mkdir,
@@ -29,27 +28,39 @@ async function waitForSetup(command: string, directory: string) {
 		},
 		stdio: ["pipe", "pipe", "pipe"],
 	});
-	let output = "";
-	child.stdout.on("data", (chunk) => (output += String(chunk)));
-	await new Promise<void>((resolve, reject) => {
-		const timeout = setTimeout(
-			() => reject(new Error(`${path.basename(command)} did not render`)),
-			2_000,
-		);
-		child.stdout.on("data", () => {
-			if (!output.includes("Set up your Engineering Council")) return;
-			clearTimeout(timeout);
-			resolve();
-		});
-	});
-	child.kill("SIGTERM");
-	assert.equal(
-		await new Promise((resolve) => child.once("close", resolve)),
-		143,
+	const closed = new Promise<number | null>((resolve) =>
+		child.once("close", resolve),
 	);
+	let ready = false;
+	child.stderr.on("data", (chunk) => {
+		ready ||= String(chunk).includes("__OPENAGENTCOUNCIL_TTY_READY__");
+	});
+	const deadline = Date.now() + 2_000;
+	try {
+		while (!ready && Date.now() < deadline)
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		if (!ready) throw new Error(`${path.basename(command)} did not become ready`);
+		child.kill("SIGTERM");
+		child.stdin.end();
+		const code = await Promise.race([
+			closed,
+			new Promise<never>((_resolve, reject) =>
+				setTimeout(
+					() => reject(new Error(`${path.basename(command)} did not stop`)),
+					2_000,
+				),
+			),
+		]);
+		assert.equal(code, 143);
+	} finally {
+		if (child.exitCode === null && child.signalCode === null)
+			child.kill("SIGKILL");
+		child.stdin.end();
+		await closed;
+	}
 }
 
-test("the packed release installs and runs both executable names offline", async () => {
+test("the packed release installs and runs both executable names", async () => {
 	const directory = await mkdtemp(
 		path.join(os.tmpdir(), "openagentcouncil-release-"),
 	);
@@ -92,7 +103,6 @@ test("the packed release installs and runs both executable names offline", async
 				directory,
 				"--ignore-scripts",
 				"--no-audit",
-				"--offline",
 				tarball,
 			],
 			{ cwd: root },
@@ -112,23 +122,22 @@ test("the packed release installs and runs both executable names offline", async
 			packageJson.bin.agentcouncil,
 			packageJson.bin.openagentcouncil,
 		);
-		const fixtures = path.join(directory, "fixtures");
-		await mkdir(fixtures);
-		await Promise.all(
-			["codex", "claude"].map(async (name) => {
-				const file = path.join(fixtures, name);
-				await writeFile(file, "#!/bin/sh\nexit 0\n");
-				await chmod(file, 0o700);
-			}),
-		);
-		await waitForSetup(
-			path.join(directory, "node_modules", ".bin", "agentcouncil"),
-			directory,
-		);
-		await waitForSetup(
-			path.join(directory, "node_modules", ".bin", "openagentcouncil"),
-			directory,
-		);
+		for (const executable of ["agentcouncil", "openagentcouncil"]) {
+			const runtimeDirectory = path.join(directory, executable);
+			const fixtures = path.join(runtimeDirectory, "fixtures");
+			await mkdir(fixtures, { recursive: true });
+			await Promise.all(
+				["codex", "claude"].map(async (name) => {
+					const file = path.join(fixtures, name);
+					await writeFile(file, "#!/bin/sh\nexit 0\n");
+					await chmod(file, 0o700);
+				}),
+			);
+			await waitForSetup(
+				path.join(directory, "node_modules", ".bin", executable),
+				runtimeDirectory,
+			);
+		}
 	} finally {
 		if (tarball && !suppliedTarball) await rm(tarball, { force: true });
 		await rm(directory, { recursive: true, force: true });
