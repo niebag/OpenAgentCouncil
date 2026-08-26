@@ -22,6 +22,7 @@ async function waitForSetup(command: string, directory: string) {
 		cwd: directory,
 		env: {
 			...process.env,
+			CI: "0",
 			HOME: directory,
 			PATH: `${path.join(directory, "fixtures")}${path.delimiter}${process.env.PATH}`,
 			NODE_OPTIONS: `--import=${path.join(root, "test", "tty-shim.mjs")}`,
@@ -39,7 +40,8 @@ async function waitForSetup(command: string, directory: string) {
 	try {
 		while (!ready && Date.now() < deadline)
 			await new Promise((resolve) => setTimeout(resolve, 10));
-		if (!ready) throw new Error(`${path.basename(command)} did not become ready`);
+		if (!ready)
+			throw new Error(`${path.basename(command)} did not become ready`);
 		child.kill("SIGTERM");
 		child.stdin.end();
 		const code = await Promise.race([

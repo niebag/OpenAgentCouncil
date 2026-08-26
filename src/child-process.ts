@@ -10,8 +10,7 @@ function exited(child: ChildProcessWithoutNullStreams) {
 
 function running(child: ChildProcessWithoutNullStreams) {
 	if (child.pid === undefined) return false;
-	if (!ownsProcessGroup)
-		return !exited(child);
+	if (!ownsProcessGroup) return !exited(child);
 	try {
 		process.kill(-child.pid, 0);
 		return true;

@@ -69,6 +69,7 @@ test("the built entrypoint restores its terminal on SIGTERM", async () => {
 				cwd: root,
 				env: {
 					...process.env,
+					CI: "0",
 					HOME: directory,
 					PATH: "",
 					OPENAGENTCOUNCIL_TTY_HOLD: "1",
@@ -83,20 +84,26 @@ test("the built entrypoint restores its terminal on SIGTERM", async () => {
 		child.stdout.on("data", (chunk) => {
 			output += String(chunk);
 		});
-		await new Promise<void>((resolve, reject) => {
-			const timeout = setTimeout(
-				() => reject(new Error("built entrypoint did not render")),
-				2_000,
-			);
-			child.stdout.on("data", () => {
-				if (!output.includes("Install Codex or Claude Code")) return;
-				clearTimeout(timeout);
-				resolve();
+		try {
+			await new Promise<void>((resolve, reject) => {
+				const timeout = setTimeout(
+					() => reject(new Error("built entrypoint did not render")),
+					2_000,
+				);
+				child.stdout.on("data", () => {
+					if (!output.includes("Install Codex or Claude Code")) return;
+					clearTimeout(timeout);
+					resolve();
+				});
 			});
-		});
-		child.kill("SIGTERM");
-		assert.equal(await closed, 143);
-		assert.ok(output.includes(`${String.fromCharCode(27)}[?25h`));
+			child.kill("SIGTERM");
+			assert.equal(await closed, 143);
+			assert.ok(output.includes(`${String.fromCharCode(27)}[?25h`));
+		} finally {
+			if (child.exitCode === null && child.signalCode === null)
+				child.kill("SIGKILL");
+			await closed;
+		}
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
