@@ -22,6 +22,15 @@ import { createTestRepository } from "./repository.js";
 
 const settle = (delay = 100) =>
 	new Promise((resolve) => setTimeout(resolve, delay));
+
+async function waitForSavedSession(directory: string) {
+	for (let attempt = 0; attempt < 20; attempt += 1) {
+		if ((await loadSessionMetadata(directory)).length > 0) return;
+		await settle(25);
+	}
+	throw new Error("Session was not saved");
+}
+
 async function providerPath(directory: string, providers: string[]) {
 	const binDirectory = path.join(directory, "bin");
 	await mkdir(binDirectory);
@@ -89,6 +98,7 @@ test("starts a fresh Session with /new and runs a question", async () => {
 		/Recommendation for “Should we ship it\?”/,
 	);
 	assert.match(instance.frames.join(""), /YOU[\s\S]*Should we ship it\?/);
+	await waitForSavedSession(configurationDirectory);
 	instance.unmount();
 	await rm(configurationDirectory, { recursive: true, force: true });
 });

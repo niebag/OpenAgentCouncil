@@ -553,7 +553,7 @@ test("normalizes App Server failures with source metadata", async () => {
 		const session = runtimeSession(server.directory);
 		const events = await runDeliberation(session, "Should we ship?", {
 			adapter: runtimeAdapter(server, {
-				timeoutMs: 100,
+				timeoutMs: 500,
 				terminationGraceMs: 25,
 			}),
 		});

@@ -1,7 +1,8 @@
 {
 	"name": "openagentcouncil",
 	"version": "0.1.0",
-	"private": true,
+	"description": "A local terminal council for deliberate decisions with Codex and Claude Code.",
+	"license": "MIT",
 	"type": "module",
 	"engines": {
 		"node": "24.x"
@@ -10,14 +11,18 @@
 		"agentcouncil": "dist/index.js",
 		"openagentcouncil": "dist/index.js"
 	},
+	"files": [
+		"dist"
+	],
 	"scripts": {
 		"build": "tsc -p tsconfig.build.json",
 		"format": "biome format --write .",
 		"lint": "biome lint .",
 		"quality": "npm run format && npm run lint && npm run typecheck",
 		"start": "node dist/index.js",
-		"test": "tsx --test test/*.test.ts test/*.test.tsx",
-		"typecheck": "tsc --noEmit"
+		"test": "tsx --test --test-concurrency=1 test/*.test.ts test/*.test.tsx",
+		"typecheck": "tsc --noEmit",
+		"release:validate": "npm run build && tsx --test test/release.test.ts"
 	},
 	"dependencies": {
 		"@inkjs/ui": "^2.0.0",
