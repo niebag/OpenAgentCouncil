@@ -20,7 +20,7 @@
 		"lint": "biome lint .",
 		"quality": "npm run format && npm run lint && npm run typecheck",
 		"start": "node dist/index.js",
-		"test": "tsx --test --test-concurrency=1 test/*.test.ts test/*.test.tsx",
+		"test": "npm run build && tsx --test --test-concurrency=1 test/*.test.ts test/*.test.tsx",
 		"typecheck": "tsc --noEmit",
 		"release:validate": "npm run build && tsx --test test/release.test.ts"
 	},
