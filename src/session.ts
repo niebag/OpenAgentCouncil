@@ -134,6 +134,24 @@ export type CouncilRequest = {
 	onPartial: () => void;
 };
 
+export function councilPrompt(request: CouncilRequest) {
+	const action =
+		request.phase === "position"
+			? "Form your independent Position for this Council Deliberation."
+			: request.phase === "review"
+				? "Review the Draft Recommendation for errors, omissions, and material Dissent."
+				: `Contribute to the Council ${request.phase}.`;
+	return [
+		`${action} Return only the completed ${request.phase === "position" ? "Position" : "contribution"} in Markdown.`,
+		`Question:\n${request.question}`,
+		request.priorContent.length > 0
+			? `Prior completed Council content:\n${request.priorContent.join("\n\n")}`
+			: "",
+	]
+		.filter(Boolean)
+		.join("\n\n");
+}
+
 type CouncilControlRequest = {
 	phase: "round" | "finalization";
 	chair: SessionMember;

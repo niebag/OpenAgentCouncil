@@ -19,6 +19,7 @@ import {
 	type Provider,
 	type ResolvedConfiguration,
 } from "./configuration.js";
+import { createClaudeCouncilAdapter } from "./claude.js";
 import { createCodexCouncilAdapter } from "./codex.js";
 import {
 	createSession,
@@ -720,7 +721,10 @@ export function App({
 		() => availableProviders ?? detectProviders(pathValue),
 	);
 	const [productionAdapter] = useState(() =>
-		createCodexCouncilAdapter({ workingDirectory }),
+		createClaudeCouncilAdapter({
+			workingDirectory,
+			fallback: createCodexCouncilAdapter({ workingDirectory }),
+		}),
 	);
 	const [configuration, setConfiguration] = useState<Configuration>();
 	const [recentSessions, setRecentSessions] = useState<SessionMetadata[]>([]);
