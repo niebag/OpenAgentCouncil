@@ -84,11 +84,17 @@ export type CouncilAdapter = {
 
 export const deterministicFakeAdapter: CouncilAdapter = {
 	selectParticipants({ members }) {
-		return members
+		const selected = members
 			.filter(
 				(member) => member.role === "Researcher" || member.role === "Critic",
 			)
 			.map((member) => member.handle);
+		return selected.length >= 2
+			? selected
+			: members
+					.filter((member) => member.role !== "Chair")
+					.slice(0, 2)
+					.map((member) => member.handle);
 	},
 	respond({ phase, member, question }) {
 		const subject = `“${question}”`;
@@ -136,6 +142,7 @@ export function createSession({
 			name: council.name,
 			members: council.members.map((member) => ({
 				...member,
+				capabilities: member.capabilities && [...member.capabilities],
 				profileContent: profileContents[member.profile] ?? "",
 			})),
 		},

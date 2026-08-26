@@ -3,25 +3,28 @@ import { Box, Text, useWindowSize } from "ink";
 import { useEffect, useRef, useState } from "react";
 import { TextArea, type TextAreaHandle } from "react-ink-textarea";
 import {
+	configurationPath,
 	createEngineeringCouncil,
 	defaultConfigurationDirectory,
 	detectProviders,
 	loadConfiguration,
+	loadResolvedConfiguration,
+	openConfiguration,
 	type Configuration,
 	type Member,
 	type Provider,
+	type ResolvedConfiguration,
 } from "./configuration.js";
 import {
 	createSession,
 	loadSessionMetadata,
-	readProfileContents,
 	runDeliberation,
 	saveSession,
 	type Session,
 	type SessionMetadata,
 } from "./session.js";
 
-const memberStyle: Record<Member["role"], { color: string; glyph: string }> = {
+const memberStyle: Record<string, { color: string; glyph: string }> = {
 	Chair: { color: "yellow", glyph: "◆" },
 	Researcher: { color: "cyan", glyph: "●" },
 	Critic: { color: "magenta", glyph: "▲" },
@@ -47,7 +50,10 @@ function Roster({
 				COUNCIL ROSTER
 			</Text>
 			{members.map((member) => {
-				const style = memberStyle[member.role];
+				const style = memberStyle[member.role] ?? {
+					color: "white",
+					glyph: "●",
+				};
 				return (
 					<Box key={member.handle} marginRight={1}>
 						<Text color={style.color}>
@@ -66,42 +72,48 @@ function CouncilScreen({
 	configuration,
 	configurationDirectory,
 	recentSessions,
+	onReloadConfiguration,
+	onOpenConfiguration,
 }: {
 	workingDirectory: string;
 	configuration: Configuration;
 	configurationDirectory: string;
 	recentSessions: SessionMetadata[];
+	onReloadConfiguration: () => Promise<ResolvedConfiguration>;
+	onOpenConfiguration: (file: string) => Promise<void>;
 }) {
 	const { columns } = useWindowSize();
 	const [draft, setDraft] = useState("");
 	const [session, setSession] = useState<Session>();
-	const [choosingCouncil, setChoosingCouncil] = useState(false);
+	const [newSessionConfiguration, setNewSessionConfiguration] =
+		useState<ResolvedConfiguration>();
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string>();
+	const [notice, setNotice] = useState<string>();
 	const [statuses, setStatuses] = useState<
 		Record<string, "waiting" | "working" | "completed">
 	>({});
 	const textareaRef = useRef<TextAreaHandle>(null);
 	const narrow = columns < 72;
-	const council = configuration.councils[0];
+	const council = (newSessionConfiguration?.configuration ?? configuration)
+		.councils[0];
 	if (!council) return null;
 	const startSession = async (
 		selectedCouncil: Configuration["councils"][number],
+		profileContents: Record<string, string>,
 	) => {
 		try {
 			const nextSession = createSession({
 				council: selectedCouncil,
 				workingDirectory,
-				profileContents: await readProfileContents(
-					configurationDirectory,
-					selectedCouncil,
-				),
+				profileContents,
 			});
 			await saveSession(configurationDirectory, nextSession);
 			setSession(nextSession);
 			setStatuses({});
-			setChoosingCouncil(false);
+			setNewSessionConfiguration(undefined);
 			setError(undefined);
+			setNotice(undefined);
 		} catch (error) {
 			setError(
 				error instanceof Error ? error.message : "Could not start Session",
@@ -112,7 +124,34 @@ function CouncilScreen({
 		const question = draft.trim();
 		setDraft("");
 		if (question === "/new") {
-			setChoosingCouncil(true);
+			try {
+				setNewSessionConfiguration(await onReloadConfiguration());
+				setError(undefined);
+			} catch (error) {
+				setError(
+					error instanceof Error
+						? error.message
+						: "Could not load configuration",
+				);
+			}
+			return;
+		}
+		if (question === "/config") {
+			setNotice(`Configuration: ${configurationPath(configurationDirectory)}`);
+			setError(undefined);
+			return;
+		}
+		if (question === "/config open") {
+			const file = configurationPath(configurationDirectory);
+			try {
+				await onOpenConfiguration(file);
+				setNotice(`Opened configuration: ${file}`);
+				setError(undefined);
+			} catch (error) {
+				setError(
+					`Could not open configuration at ${file}: ${error instanceof Error ? error.message : "unknown error"}`,
+				);
+			}
 			return;
 		}
 		if (!question) return;
@@ -165,19 +204,26 @@ function CouncilScreen({
 					<Text bold color="blue">
 						MESSAGE THE COUNCIL
 					</Text>
-					{choosingCouncil ? (
+					{newSessionConfiguration ? (
 						<Box flexDirection="column">
 							<Text>Choose a Council for this new Session.</Text>
 							<Select
-								options={configuration.councils.map((council) => ({
-									label: council.name,
-									value: council.name,
-								}))}
+								options={newSessionConfiguration.configuration.councils.map(
+									(council) => ({
+										label: council.name,
+										value: council.name,
+									}),
+								)}
 								onChange={(name) => {
-									const selectedCouncil = configuration.councils.find(
-										(council) => council.name === name,
-									);
-									if (selectedCouncil) void startSession(selectedCouncil);
+									const selectedCouncil =
+										newSessionConfiguration.configuration.councils.find(
+											(council) => council.name === name,
+										);
+									if (selectedCouncil)
+										void startSession(
+											selectedCouncil,
+											newSessionConfiguration.profileContents,
+										);
 								}}
 							/>
 						</Box>
@@ -214,6 +260,7 @@ function CouncilScreen({
 							</Text>
 						))}
 					{error && <StatusMessage variant="error">{error}</StatusMessage>}
+					{notice && <Text>{notice}</Text>}
 				</Box>
 			</Box>
 		</Box>
@@ -225,6 +272,7 @@ type AppProps = {
 	configurationDirectory?: string;
 	availableProviders?: Provider[];
 	pathValue?: string;
+	openConfiguration?: (file: string) => Promise<void>;
 };
 
 function Setup({
@@ -271,6 +319,7 @@ export function App({
 	configurationDirectory,
 	availableProviders,
 	pathValue,
+	openConfiguration: openConfigurationOverride,
 }: AppProps) {
 	const [directory] = useState(
 		() => configurationDirectory ?? defaultConfigurationDirectory(),
@@ -282,6 +331,11 @@ export function App({
 	const [recentSessions, setRecentSessions] = useState<SessionMetadata[]>([]);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string>();
+	const reloadConfiguration = async () => {
+		const resolved = await loadResolvedConfiguration(directory, providers);
+		setConfiguration(resolved.configuration);
+		return resolved;
+	};
 
 	useEffect(() => {
 		Promise.all([
@@ -313,6 +367,8 @@ export function App({
 				configuration={configuration}
 				configurationDirectory={directory}
 				recentSessions={recentSessions}
+				onReloadConfiguration={reloadConfiguration}
+				onOpenConfiguration={openConfigurationOverride ?? openConfiguration}
 			/>
 		);
 	}

@@ -82,6 +82,101 @@ test("starts a fresh Session with /new and runs a question", async () => {
 	await rm(configurationDirectory, { recursive: true, force: true });
 });
 
+test("selects a configured Council and exposes configuration commands", async () => {
+	const configurationDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-"),
+	);
+	await createEngineeringCouncil(configurationDirectory, "codex");
+	await writeFile(
+		path.join(configurationDirectory, "council.json"),
+		JSON.stringify({
+			version: 1,
+			councils: [
+				{
+					name: "Architecture Council",
+					members: [
+						{
+							handle: "chair",
+							role: "Chair",
+							provider: "codex",
+							profile: "profiles/chair.md",
+						},
+						{
+							handle: "researcher",
+							role: "Researcher",
+							provider: "codex",
+							profile: "profiles/researcher.md",
+						},
+						{
+							handle: "critic",
+							role: "Critic",
+							provider: "codex",
+							profile: "profiles/critic.md",
+						},
+					],
+				},
+				{
+					name: "Product Council",
+					members: [
+						{
+							handle: "chair",
+							role: "Chair",
+							provider: "codex",
+							profile: "profiles/chair.md",
+						},
+						{
+							handle: "researcher",
+							role: "Researcher",
+							provider: "codex",
+							profile: "profiles/researcher.md",
+						},
+						{
+							handle: "critic",
+							role: "Critic",
+							provider: "codex",
+							profile: "profiles/critic.md",
+						},
+					],
+				},
+			],
+		}),
+	);
+	const instance = render(
+		createElement(App, {
+			workingDirectory: "/tmp/council-workspace",
+			configurationDirectory,
+			availableProviders: ["codex"],
+			openConfiguration: async () => {
+				throw new Error("opener unavailable");
+			},
+		}),
+	);
+	await settle();
+	instance.stdin.write("/config");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	assert.match(instance.lastFrame() ?? "", /Configuration: /);
+	assert.match(instance.lastFrame() ?? "", /council\.json/);
+	instance.stdin.write("/config open");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	assert.match(instance.lastFrame() ?? "", /Could not open configuration/);
+	assert.match(instance.lastFrame() ?? "", /opener/);
+	assert.match(instance.lastFrame() ?? "", /unavailable/);
+	instance.stdin.write("/new");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("\x1B[B");
+	instance.stdin.write("\r");
+	await settle();
+	assert.match(instance.lastFrame() ?? "", /Session started: Product Council/);
+	instance.unmount();
+	await rm(configurationDirectory, { recursive: true, force: true });
+});
+
 test("onboards a Codex Engineering Council and saves its Member Profiles", async () => {
 	const configurationDirectory = await mkdtemp(
 		path.join(os.tmpdir(), "openagentcouncil-"),

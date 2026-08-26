@@ -1,4 +1,5 @@
 import { accessSync, constants } from "node:fs";
+import { spawn } from "node:child_process";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -7,9 +8,12 @@ export type Provider = "codex" | "claude";
 
 export type Member = {
 	handle: string;
-	role: "Chair" | "Researcher" | "Critic" | "Prototyper";
+	role: string;
 	provider: Provider;
 	profile: string;
+	model?: string;
+	reasoningEffort?: string;
+	capabilities?: "web"[];
 };
 
 export type Configuration = {
@@ -20,6 +24,22 @@ export type Configuration = {
 export type Council = { name: string; members: Member[] };
 
 const configurationFile = "council.json";
+
+export function configurationPath(directory: string) {
+	return path.join(directory, configurationFile);
+}
+
+export function openConfiguration(file: string): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const command = process.platform === "darwin" ? "open" : "xdg-open";
+		const child = spawn(command, [file], { stdio: "ignore", detached: true });
+		child.once("error", reject);
+		child.once("spawn", () => {
+			child.unref();
+			resolve();
+		});
+	});
+}
 
 export function defaultConfigurationDirectory(platform = process.platform) {
 	return platform === "darwin"
@@ -58,6 +78,20 @@ function string(value: unknown, name: string): string {
 	return value;
 }
 
+function optionalString(value: unknown, name: string): string | undefined {
+	if (value === undefined) return undefined;
+	return string(value, name);
+}
+
+class ConfigurationError extends Error {
+	constructor(
+		errors: string[],
+		readonly configuration?: Configuration,
+	) {
+		super(errors.join("\n"));
+	}
+}
+
 export function validateConfiguration(
 	value: unknown,
 	availableProviders: readonly Provider[],
@@ -70,55 +104,75 @@ export function validateConfiguration(
 		throw new Error("Configuration must include a Council");
 	}
 
-	const councils = configuration.councils.map((value, councilIndex) => {
+	const errors: string[] = [];
+	const councils = configuration.councils.flatMap((value, councilIndex) => {
 		const council = asRecord(value, `Council ${councilIndex + 1}`);
 		if (!Array.isArray(council.members)) {
 			throw new Error(
 				`Council ${councilIndex + 1} must include Council Members`,
 			);
 		}
-		const members = council.members.map((value, memberIndex) => {
+		const members = council.members.flatMap((value, memberIndex) => {
 			const member = asRecord(value, `Council Member ${memberIndex + 1}`);
+			const handle = string(member.handle, "Member Handle");
+			const label = `Council ${councilIndex + 1}, Member ${handle}`;
 			const provider = string(member.provider, "Provider");
+			const normalizedProvider: Provider =
+				provider === "claude" ? "claude" : "codex";
 			if (provider !== "codex" && provider !== "claude") {
-				throw new Error(
-					`Council Member ${memberIndex + 1} has an unsupported provider`,
-				);
+				errors.push(`${label}: provider must be codex or claude`);
 			}
-			if (!availableProviders.includes(provider)) {
-				throw new Error(
-					`Council Member ${memberIndex + 1} requires unavailable ${provider}`,
-				);
+			if (
+				(provider === "codex" || provider === "claude") &&
+				!availableProviders.includes(provider)
+			) {
+				errors.push(`${label}: provider ${provider} is unavailable`);
 			}
 			const profile = string(member.profile, "Member Profile");
 			if (path.isAbsolute(profile) || profile.split(path.sep).includes("..")) {
-				throw new Error(
-					`Council Member ${memberIndex + 1} has an invalid Member Profile path`,
+				errors.push(
+					`${label}: Member Profile must stay within the configuration directory`,
 				);
+			}
+			if (!profile.endsWith(".md")) {
+				errors.push(`${label}: Member Profile must be Markdown (.md)`);
 			}
 			const role = string(member.role, "Role");
-			if (!["Chair", "Researcher", "Critic", "Prototyper"].includes(role)) {
-				throw new Error(
-					`Council Member ${memberIndex + 1} has an invalid role`,
-				);
+			const capabilities = member.capabilities;
+			if (
+				capabilities !== undefined &&
+				(!Array.isArray(capabilities) ||
+					capabilities.some((capability) => capability !== "web"))
+			) {
+				errors.push(`${label}: capabilities may only include web`);
 			}
-			return {
-				handle: string(member.handle, "Member Handle"),
-				role,
-				provider,
-				profile,
-			} as Member;
+			return [
+				{
+					handle,
+					role,
+					provider: normalizedProvider,
+					profile,
+					model: optionalString(member.model, "Model"),
+					reasoningEffort: optionalString(
+						member.reasoningEffort,
+						"Reasoning effort",
+					),
+					capabilities: capabilities as Member["capabilities"],
+				},
+			];
 		});
 		if (members.filter((member) => member.role === "Chair").length !== 1) {
-			throw new Error("A Council must have exactly one Chair");
+			errors.push(`Council ${councilIndex + 1}: exactly one Chair is required`);
 		}
 		if (members.filter((member) => member.role !== "Chair").length < 2) {
-			throw new Error("A Council needs at least two non-Chair Council Members");
+			errors.push(
+				`Council ${councilIndex + 1}: at least two non-Chair Council Members are required`,
+			);
 		}
 		if (
 			new Set(members.map((member) => member.handle)).size !== members.length
 		) {
-			throw new Error("Council Member Handles must be unique");
+			errors.push(`Council ${councilIndex + 1}: duplicate Member Handle`);
 		}
 		const name = string(council.name, "Council name");
 		if (
@@ -127,32 +181,78 @@ export function validateConfiguration(
 				(role) => members.filter((member) => member.role === role).length === 1,
 			)
 		) {
-			throw new Error(
+			errors.push(
 				"Engineering Council requires Chair, Researcher, Critic, and Prototyper",
 			);
 		}
-		return { name, members };
+		return [{ name, members }];
 	});
 
-	return { version: 1, councils };
+	const result = { version: 1 as const, councils };
+	if (errors.length > 0) throw new ConfigurationError(errors, result);
+	return result;
+}
+
+export type ResolvedConfiguration = {
+	configuration: Configuration;
+	profileContents: Record<string, string>;
+};
+
+export async function loadResolvedConfiguration(
+	directory: string,
+	availableProviders: readonly Provider[],
+): Promise<ResolvedConfiguration> {
+	let configuration: Configuration;
+	const errors: string[] = [];
+	try {
+		configuration = validateConfiguration(
+			JSON.parse(
+				await readFile(path.join(directory, configurationFile), "utf8"),
+			),
+			availableProviders,
+		);
+	} catch (error) {
+		if (!(error instanceof ConfigurationError) || !error.configuration)
+			throw error;
+		configuration = error.configuration;
+		errors.push(error.message);
+	}
+	const profiles = configuration.councils.flatMap((council) => council.members);
+	const results = await Promise.allSettled(
+		profiles.map((member) =>
+			path.isAbsolute(member.profile) ||
+			member.profile.split(path.sep).includes("..")
+				? Promise.resolve("")
+				: readFile(path.resolve(directory, member.profile), "utf8"),
+		),
+	);
+	errors.push(
+		...results.flatMap((result, index) =>
+			result.status === "rejected"
+				? [
+						`Member ${profiles[index]?.handle} Member Profile: ${result.reason.message}`,
+					]
+				: [],
+		),
+	);
+	if (errors.length > 0) throw new ConfigurationError(errors);
+	return {
+		configuration,
+		profileContents: Object.fromEntries(
+			profiles.map((member, index) => [
+				member.profile,
+				(results[index] as PromiseFulfilledResult<string>).value,
+			]),
+		),
+	};
 }
 
 export async function loadConfiguration(
 	directory: string,
 	availableProviders: readonly Provider[],
 ): Promise<Configuration> {
-	const configuration = validateConfiguration(
-		JSON.parse(await readFile(path.join(directory, configurationFile), "utf8")),
-		availableProviders,
-	);
-	await Promise.all(
-		configuration.councils.flatMap((council) =>
-			council.members.map((member) =>
-				readFile(path.join(directory, member.profile), "utf8"),
-			),
-		),
-	);
-	return configuration;
+	return (await loadResolvedConfiguration(directory, availableProviders))
+		.configuration;
 }
 
 export async function createEngineeringCouncil(
