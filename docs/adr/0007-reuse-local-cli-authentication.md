@@ -1,0 +1,3 @@
+# Reuse local CLI authentication
+
+OpenAgentCouncil invokes each locally installed Codex or Claude Code CLI with the authentication and process environment already configured by its user. It does not implement login flows, copy credentials, inspect tokens or guess which environment variables contain unrelated secrets. This keeps local use equivalent to launching the CLIs manually. The README will state that OpenAgentCouncil is not affiliated with OpenAI or Anthropic. Anthropic's published guidance still creates a distribution risk for subscription OAuth, so that point must be verified before the first public release.
