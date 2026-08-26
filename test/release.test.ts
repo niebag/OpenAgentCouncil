@@ -53,17 +53,20 @@ test("the packed release installs and runs both executable names offline", async
 	const directory = await mkdtemp(
 		path.join(os.tmpdir(), "openagentcouncil-release-"),
 	);
-	let tarball = "";
+	const suppliedTarball = process.env.OPENAGENTCOUNCIL_TARBALL;
+	let tarball = suppliedTarball ? path.resolve(root, suppliedTarball) : "";
 	try {
-		const { stdout } = await execFile(
-			"npm",
-			["pack", "--json", "--ignore-scripts"],
-			{
-				cwd: root,
-			},
-		);
-		const packed = JSON.parse(stdout) as [{ filename: string }];
-		tarball = path.join(root, packed[0].filename);
+		if (!tarball) {
+			const { stdout } = await execFile(
+				"npm",
+				["pack", "--json", "--ignore-scripts"],
+				{
+					cwd: root,
+				},
+			);
+			const packed = JSON.parse(stdout) as [{ filename: string }];
+			tarball = path.join(root, packed[0].filename);
+		}
 		const { stdout: files } = await execFile("tar", ["-tzf", tarball]);
 		assert.deepEqual(
 			files.trim().split("\n").sort(),
@@ -127,7 +130,7 @@ test("the packed release installs and runs both executable names offline", async
 			directory,
 		);
 	} finally {
-		if (tarball) await rm(tarball, { force: true });
+		if (tarball && !suppliedTarball) await rm(tarball, { force: true });
 		await rm(directory, { recursive: true, force: true });
 	}
 });
