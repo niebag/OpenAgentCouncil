@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
 import {
 	chmod,
 	mkdir,
@@ -13,6 +14,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
 	loadResolvedConfiguration,
 	validateConfiguration,
@@ -26,6 +28,7 @@ import {
 	runDeliberation,
 	saveSession,
 } from "../src/session.js";
+import { createTestRepository } from "./repository.js";
 
 const [council] = validateConfiguration(
 	{
@@ -66,6 +69,8 @@ const [council] = validateConfiguration(
 ).councils;
 
 if (!council) throw new Error("Engineering Council fixture is required");
+
+const execFile = promisify(execFileCallback);
 
 test("loads a custom Council with optional overrides and snapshots its profiles", async () => {
 	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
@@ -271,6 +276,241 @@ test("runs and persists a normalized fake Deliberation", async () => {
 	await rm(directory, { recursive: true, force: true });
 });
 
+test("approves one Assignment and persists its Artifact and complete repository diff", async () => {
+	const workingDirectory = await createTestRepository();
+	const configurationDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-"),
+	);
+	const session = createSession({
+		council,
+		workingDirectory,
+		profileContents: {},
+	});
+	await writeFile(path.join(workingDirectory, "README.md"), "dirty before\n");
+	await writeFile(
+		path.join(workingDirectory, "preexisting.txt"),
+		"not Assignment work\n",
+	);
+	let round = 0;
+	const proposal = {
+		member: "prototyper",
+		goal: "Create runnable evidence",
+		expectedFiles: ["prototype.txt"],
+	};
+
+	await runDeliberation(session, "Can we prove it?", {
+		adapter: {
+			...deterministicFakeAdapter,
+			control({ phase }) {
+				if (phase === "round" && round++ === 0)
+					return JSON.stringify({ kind: "propose-assignment", ...proposal });
+				return deterministicFakeAdapter.control({ phase } as never);
+			},
+			async respond(request) {
+				if (request.phase !== "assignment")
+					return deterministicFakeAdapter.respond(request);
+				await writeFile(
+					path.join(workingDirectory, "README.md"),
+					"# Fixture\n",
+				);
+				await writeFile(
+					path.join(workingDirectory, "prototype.txt"),
+					"evidence\n",
+				);
+				await writeFile(
+					path.join(workingDirectory, "unexpected.txt"),
+					"visible\n",
+				);
+				return "Created runnable evidence.";
+			},
+		},
+		onAssignmentProposal(value) {
+			assert.deepEqual(value, proposal);
+			return Promise.resolve("approved");
+		},
+	});
+	await saveSession(configurationDirectory, session);
+
+	const loaded = await loadSession(configurationDirectory, session.id);
+	const artifact = loaded.timeline.find((entry) => entry.kind === "artifact");
+	assert.equal(artifact?.deliberationId, "deliberation-1");
+	assert.equal(artifact?.member, "prototyper");
+	assert.equal(artifact?.content, "Created runnable evidence.");
+	assert.equal(artifact?.approval.decision, "approved");
+	assert.match(artifact?.diff ?? "", /prototype\.txt/);
+	assert.match(artifact?.diff ?? "", /unexpected\.txt/);
+	assert.match(artifact?.diff ?? "", /-dirty before/);
+	assert.match(artifact?.diff ?? "", /\+# Fixture/);
+	assert.doesNotMatch(artifact?.diff ?? "", /preexisting\.txt/);
+	assert.deepEqual(
+		loaded.timeline
+			.filter(
+				(entry) =>
+					entry.kind === "assignment-proposal" ||
+					entry.kind === "assignment-decision" ||
+					entry.kind === "artifact",
+			)
+			.map((entry) => entry.kind),
+		["assignment-proposal", "assignment-decision", "artifact"],
+	);
+	await rm(configurationDirectory, { recursive: true, force: true });
+	await rm(workingDirectory, { recursive: true, force: true });
+});
+
+test("rejects an Assignment without changing the workspace", async () => {
+	const workingDirectory = await createTestRepository();
+	const session = createSession({
+		council,
+		workingDirectory,
+		profileContents: {},
+	});
+	let assignmentRan = false;
+	let round = 0;
+	await runDeliberation(session, "Should we write it?", {
+		adapter: {
+			...deterministicFakeAdapter,
+			control({ phase }) {
+				if (phase === "round" && round++ === 0)
+					return JSON.stringify({
+						kind: "propose-assignment",
+						member: "prototyper",
+						goal: "Create evidence",
+						expectedFiles: ["evidence.txt"],
+					});
+				return deterministicFakeAdapter.control({ phase } as never);
+			},
+			respond(request) {
+				if (request.phase === "assignment") assignmentRan = true;
+				return deterministicFakeAdapter.respond(request);
+			},
+		},
+		onAssignmentProposal: () => "rejected",
+	});
+
+	assert.equal(assignmentRan, false);
+	assert.equal(
+		session.timeline.find((entry) => entry.kind === "assignment-decision")
+			?.decision,
+		"rejected",
+	);
+	assert.equal(
+		(await execFile("git", ["status", "--short"], { cwd: workingDirectory }))
+			.stdout,
+		"",
+	);
+	await rm(workingDirectory, { recursive: true, force: true });
+});
+
+test("never runs two approved Assignments concurrently", async () => {
+	const workingDirectory = await createTestRepository();
+	const first = createSession({
+		council,
+		workingDirectory,
+		profileContents: {},
+	});
+	const second = createSession({
+		council,
+		workingDirectory,
+		profileContents: {},
+	});
+	const rounds = new Map<string, number>();
+	let release: () => void = () => {};
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let started: () => void = () => {};
+	const assignmentStarted = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	let secondAssignmentRan = false;
+	const adapter = {
+		...deterministicFakeAdapter,
+		control(input: Parameters<typeof deterministicFakeAdapter.control>[0]) {
+			const round = rounds.get(input.question) ?? 0;
+			rounds.set(input.question, round + 1);
+			if (input.phase === "round" && round === 0)
+				return JSON.stringify({
+					kind: "propose-assignment",
+					member: "prototyper",
+					goal: input.question,
+					expectedFiles: ["proof.txt"],
+				});
+			return deterministicFakeAdapter.control(input);
+		},
+		async respond(
+			request: Parameters<typeof deterministicFakeAdapter.respond>[0],
+		) {
+			if (request.phase !== "assignment")
+				return deterministicFakeAdapter.respond(request);
+			if (request.question === "First Assignment") {
+				started();
+				await blocked;
+			} else secondAssignmentRan = true;
+			return "Artifact complete.";
+		},
+	};
+
+	const firstRun = runDeliberation(first, "First Assignment", {
+		adapter,
+		onAssignmentProposal: () => "approved",
+	});
+	await assignmentStarted;
+	await runDeliberation(second, "Second Assignment", {
+		adapter,
+		onAssignmentProposal: () => "approved",
+	});
+	assert.equal(secondAssignmentRan, false);
+	assert.match(
+		second.timeline.find((entry) => entry.kind === "incomplete-deliberation")
+			?.content ?? "",
+		/already writing/,
+	);
+	release();
+	await firstRun;
+	await rm(workingDirectory, { recursive: true, force: true });
+});
+
+test("persists the diff when an approved Assignment writes and then fails", async () => {
+	const workingDirectory = await createTestRepository();
+	const session = createSession({
+		council,
+		workingDirectory,
+		profileContents: {},
+	});
+	let round = 0;
+	await runDeliberation(session, "Try risky evidence", {
+		adapter: {
+			...deterministicFakeAdapter,
+			control({ phase }) {
+				if (phase === "round" && round++ === 0)
+					return JSON.stringify({
+						kind: "propose-assignment",
+						member: "prototyper",
+						goal: "Create risky evidence",
+						expectedFiles: ["partial.txt"],
+					});
+				return deterministicFakeAdapter.control({ phase } as never);
+			},
+			async respond(request) {
+				if (request.phase !== "assignment")
+					return deterministicFakeAdapter.respond(request);
+				await writeFile(
+					path.join(workingDirectory, "partial.txt"),
+					"partial\n",
+				);
+				throw new Error("fixture crashed");
+			},
+		},
+		onAssignmentProposal: () => "approved",
+	});
+
+	const artifact = session.timeline.find((entry) => entry.kind === "artifact");
+	assert.match(artifact?.content ?? "", /fixture crashed/);
+	assert.match(artifact?.diff ?? "", /partial\.txt/);
+	assert.equal(artifact?.approval.decision, "approved");
+	await rm(workingDirectory, { recursive: true, force: true });
+});
+
 test("gathers Chair-selected Positions independently as they complete", async () => {
 	const session = createSession({
 		council,
@@ -323,6 +563,41 @@ test("gathers Chair-selected Positions independently as they complete", async ()
 		["critic", "researcher"],
 	);
 	assert.doesNotMatch(JSON.stringify(session.timeline), /select-participants/);
+});
+
+test("owns the Chair provider session reference in Deliberation state", async () => {
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	const references: Array<string | undefined> = [];
+	await runDeliberation(session, "Should we ship it?", {
+		adapter: {
+			selectParticipants: deterministicFakeAdapter.selectParticipants,
+			control(request) {
+				references.push(request.providerSessionReference);
+				return {
+					content: JSON.stringify({
+						kind:
+							request.phase === "round"
+								? "draft-recommendation"
+								: "finalize-recommendation",
+					}),
+					providerSessionReference: "chair-native-session",
+				};
+			},
+			respond({ phase, member }) {
+				return `${phase} from ${member.handle}`;
+			},
+		},
+	});
+
+	assert.deepEqual(references, [undefined, "chair-native-session"]);
+	assert.equal(
+		session.deliberations[0]?.providerSessionReferences.chair,
+		"chair-native-session",
+	);
 });
 
 test("cancels a Deliberation without adding partial content", async () => {

@@ -64,6 +64,8 @@ async function terminate(
 }
 
 function expectedTools(request: CouncilRequest) {
+	if (request.phase === "assignment")
+		return ["Read", "Glob", "Grep", "Edit", "Write"];
 	return [
 		"Read",
 		"Glob",
@@ -120,6 +122,7 @@ async function runClaude(
 ): Promise<CouncilResponse> {
 	request.signal?.throwIfAborted();
 	const tools = expectedTools(request);
+	const writable = request.phase === "assignment";
 	const arguments_ = [
 		"--print",
 		"--output-format",
@@ -138,7 +141,7 @@ async function runClaude(
 		"--disallowedTools",
 		"mcp__*",
 		"--permission-mode",
-		"dontAsk",
+		writable ? "acceptEdits" : "dontAsk",
 		"--tools",
 		tools.join(","),
 		"--append-system-prompt",
@@ -307,15 +310,33 @@ export function createClaudeCouncilAdapter({
 			claudeMember = undefined;
 			return fallback.selectParticipants(input);
 		},
-		control: fallback.control,
+		async control(request) {
+			if (request.chair.provider !== "claude") return fallback.control(request);
+			return runClaude(
+				{
+					phase: "round",
+					member: request.chair,
+					question: request.question,
+					priorContent: request.priorContent,
+					workingDirectory,
+					providerSessionReference: request.providerSessionReference,
+					onPartial() {},
+					control: request,
+				},
+				{ command, timeoutMs, terminationGraceMs },
+			);
+		},
 		respond(request) {
+			const assignment =
+				request.phase === "assignment" && request.member.provider === "claude";
 			if (
+				!assignment &&
 				!claudeMember &&
 				request.member.provider === "claude" &&
 				request.member.role !== "Chair"
 			)
 				claudeMember ??= request.member.handle;
-			if (request.member.handle !== claudeMember)
+			if (!assignment && request.member.handle !== claudeMember)
 				return fallback.respond(request);
 			if (
 				path.resolve(request.workingDirectory) !==

@@ -28,6 +28,8 @@ import {
 	removeSession,
 	runDeliberation,
 	saveSession,
+	type AssignmentDecision,
+	type AssignmentProposal,
 	type CouncilAdapter,
 	type Session,
 	type SessionMetadata,
@@ -93,7 +95,10 @@ function timelineMessages(session?: Session): TranscriptMessage[] {
 				: "member" in entry
 					? entry.member
 					: "system",
-		content: entry.content,
+		content:
+			entry.kind === "artifact"
+				? `${entry.content}\n\nRepository diff:\n${entry.diff || "(no changes)"}`
+				: entry.content,
 		createdAt: entry.createdAt,
 	}));
 }
@@ -238,6 +243,10 @@ function CouncilScreen({
 		| { kind: "remove" }
 	>();
 	const [sessionToRemove, setSessionToRemove] = useState<SessionMetadata>();
+	const [pendingAssignment, setPendingAssignment] = useState<{
+		proposal: AssignmentProposal;
+		resolve: (decision: AssignmentDecision) => void;
+	}>();
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string>();
 	const [notice, setNotice] = useState<string>();
@@ -286,6 +295,8 @@ function CouncilScreen({
 	);
 	const stop = (message = "Stopped active Deliberation.") => {
 		abortController.current?.abort();
+		pendingAssignment?.resolve("rejected");
+		setPendingAssignment(undefined);
 		setStatuses({});
 		setNotice(message);
 	};
@@ -450,6 +461,10 @@ function CouncilScreen({
 		const deliberation = runDeliberation(session, value, {
 			adapter,
 			signal: controller.signal,
+			onAssignmentProposal: (proposal) =>
+				new Promise<AssignmentDecision>((resolve) =>
+					setPendingAssignment({ proposal, resolve }),
+				),
 			onEvent: (event) => {
 				if (currentRun !== runId.current) return;
 				if (event.kind === "member-status") {
@@ -492,6 +507,7 @@ function CouncilScreen({
 		} finally {
 			if (currentRun === runId.current) {
 				abortController.current = undefined;
+				setPendingAssignment(undefined);
 				setBusy(false);
 			}
 		}
@@ -600,6 +616,28 @@ function CouncilScreen({
 									onChange={(choice) => {
 										if (choice === "remove") void confirmRemove();
 										else setSessionToRemove(undefined);
+									}}
+								/>
+							</Box>
+						) : pendingAssignment ? (
+							<Box flexDirection="column">
+								<Text bold color="yellow">
+									Assignment proposal
+								</Text>
+								<Text>Member: @{pendingAssignment.proposal.member}</Text>
+								<Text>Goal: {pendingAssignment.proposal.goal}</Text>
+								<Text>Expected files:</Text>
+								{pendingAssignment.proposal.expectedFiles.map((file) => (
+									<Text key={file}>- {file}</Text>
+								))}
+								<Select
+									options={[
+										{ label: "Reject", value: "rejected" },
+										{ label: "Approve Assignment", value: "approved" },
+									]}
+									onChange={(decision) => {
+										pendingAssignment.resolve(decision as AssignmentDecision);
+										setPendingAssignment(undefined);
 									}}
 								/>
 							</Box>

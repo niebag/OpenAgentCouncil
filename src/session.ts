@@ -1,16 +1,23 @@
 import { randomUUID } from "node:crypto";
+import { execFile as execFileCallback } from "node:child_process";
 import {
 	chmod,
 	lstat,
+	mkdtemp,
 	mkdir,
 	readFile,
 	readdir,
 	rename,
+	rm,
 	unlink,
 	writeFile,
 } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import type { Council, Member, Provider } from "./configuration.js";
+
+const execFile = promisify(execFileCallback);
 
 type SessionMember = Member & { profileContent: string };
 
@@ -40,6 +47,34 @@ export type TimelineEntry =
 			createdAt: string;
 	  }
 	| ContributionEntry
+	| {
+			kind: "assignment-proposal";
+			deliberationId: string;
+			member: string;
+			goal: string;
+			expectedFiles: string[];
+			content: string;
+			createdAt: string;
+	  }
+	| {
+			kind: "assignment-decision";
+			deliberationId: string;
+			member: string;
+			decision: AssignmentDecision;
+			content: string;
+			createdAt: string;
+	  }
+	| {
+			kind: "artifact";
+			deliberationId: string;
+			member: string;
+			content: string;
+			diff: string;
+			expectedFiles: string[];
+			approval: { decision: "approved"; decidedAt: string };
+			createdAt: string;
+			source?: CouncilSource;
+	  }
 	| {
 			kind: "member-failure";
 			deliberationId: string;
@@ -123,18 +158,69 @@ export type CouncilResponse = {
 	source: CouncilSource;
 };
 
+export type CouncilControlResponse = {
+	content: string;
+	providerSessionReference?: string;
+};
+
+export type AssignmentProposal = {
+	member: string;
+	goal: string;
+	expectedFiles: string[];
+};
+
+export type AssignmentDecision = "approved" | "rejected";
+
 export type CouncilRequest = {
-	phase: CouncilPhase;
+	phase: CouncilPhase | "assignment";
 	member: SessionMember;
 	question: string;
 	priorContent: string[];
+	assignment?: AssignmentProposal;
 	workingDirectory: string;
 	providerSessionReference?: string;
 	signal?: AbortSignal;
 	onPartial: () => void;
+	control?: CouncilControlRequest;
 };
 
 export function councilPrompt(request: CouncilRequest) {
+	if (request.control) {
+		const control = request.control;
+		if (control.phase === "finalization")
+			return [
+				"Finalize the reviewed Recommendation. Return only this JSON object:",
+				'{"kind":"finalize-recommendation"}',
+			].join("\n\n");
+		return [
+			"Direct the next Council step. Return only one JSON object and no Markdown.",
+			'Open a Round: {"kind":"open-round","members":["handle"]}',
+			'Draft the Recommendation: {"kind":"draft-recommendation"}',
+			'Propose one Assignment: {"kind":"propose-assignment","member":"handle","goal":"...","expectedFiles":["path"]}',
+			`Question:\n${control.question}`,
+			`Available Council Members:\n${control.members
+				.filter((member) => member.role !== "Chair")
+				.map((member) => `- ${member.handle} (${member.role})`)
+				.join("\n")}`,
+			control.priorContent.length > 0
+				? `Prior completed Council content:\n${control.priorContent.join("\n\n")}`
+				: "",
+			`Round: ${control.round}`,
+			control.malformedControl
+				? `Repair this invalid control:\n${control.malformedControl}\n\nValidation error: ${control.validationError}`
+				: "",
+		]
+			.filter(Boolean)
+			.join("\n\n");
+	}
+	if (request.phase === "assignment") {
+		return [
+			"Complete the approved Assignment in the repository. Network access is disabled.",
+			`Goal:\n${request.assignment?.goal}`,
+			`Expected files (intent, not an allowlist):\n${request.assignment?.expectedFiles.join("\n")}`,
+			"Return a concise description of the resulting Artifact.",
+		].join("\n\n");
+	}
 	const action =
 		request.phase === "position"
 			? "Form your independent Position for this Council Deliberation."
@@ -152,13 +238,14 @@ export function councilPrompt(request: CouncilRequest) {
 		.join("\n\n");
 }
 
-type CouncilControlRequest = {
+export type CouncilControlRequest = {
 	phase: "round" | "finalization";
 	chair: SessionMember;
 	members: SessionMember[];
 	question: string;
 	round: number;
 	priorContent: string[];
+	providerSessionReference?: string;
 	malformedControl?: string;
 	validationError?: string;
 };
@@ -171,13 +258,16 @@ export type CouncilAdapter = {
 		requestedMembers: string[];
 		malformedControl?: string;
 	}): string | Promise<string>;
-	control(request: CouncilControlRequest): string | Promise<string>;
+	control(
+		request: CouncilControlRequest,
+	): string | CouncilControlResponse | Promise<string | CouncilControlResponse>;
 	respond(
 		request: CouncilRequest,
 	): string | CouncilResponse | Promise<string | CouncilResponse>;
 };
 
 const deliberationBudget = { openRounds: 2, providerCalls: 20 } as const;
+let assignmentActive = false;
 
 export const deterministicFakeAdapter: CouncilAdapter = {
 	selectParticipants({ members }) {
@@ -282,7 +372,16 @@ function participantHandles(
 	return handles as string[];
 }
 
-function roundControl(control: string, participants: SessionMember[]) {
+type RoundAction =
+	| { kind: "draft-recommendation" }
+	| { kind: "open-round"; members: string[] }
+	| ({ kind: "propose-assignment" } & AssignmentProposal);
+
+function roundControl(
+	control: string,
+	participants: SessionMember[],
+	allMembers: SessionMember[],
+): RoundAction {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(control);
@@ -295,7 +394,39 @@ function roundControl(control: string, participants: SessionMember[]) {
 		!Array.isArray(parsed) &&
 		(parsed as { kind?: unknown }).kind === "draft-recommendation"
 	) {
-		return [];
+		return { kind: "draft-recommendation" };
+	}
+	if (
+		parsed &&
+		typeof parsed === "object" &&
+		!Array.isArray(parsed) &&
+		(parsed as { kind?: unknown }).kind === "propose-assignment"
+	) {
+		const proposal = parsed as Record<string, unknown>;
+		if (
+			typeof proposal.member !== "string" ||
+			!allMembers.some(
+				(member) =>
+					member.handle === proposal.member && member.role !== "Chair",
+			) ||
+			typeof proposal.goal !== "string" ||
+			proposal.goal.trim().length === 0 ||
+			!Array.isArray(proposal.expectedFiles) ||
+			proposal.expectedFiles.length === 0 ||
+			proposal.expectedFiles.some(
+				(file) => typeof file !== "string" || file.trim().length === 0,
+			)
+		) {
+			throw new Error(
+				"Chair Assignment proposal must name a Council Member, goal, and expected files",
+			);
+		}
+		return {
+			kind: "propose-assignment",
+			member: proposal.member,
+			goal: proposal.goal,
+			expectedFiles: proposal.expectedFiles as string[],
+		};
 	}
 	const members = (parsed as { kind?: unknown; members?: unknown })?.members;
 	if (
@@ -314,7 +445,46 @@ function roundControl(control: string, participants: SessionMember[]) {
 	) {
 		throw new Error("Chair Round control must select participating Members");
 	}
-	return members as string[];
+	return { kind: "open-round", members: members as string[] };
+}
+
+async function repositorySnapshot(directory: string) {
+	const temporaryDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-index-"),
+	);
+	const environment = {
+		...process.env,
+		GIT_INDEX_FILE: path.join(temporaryDirectory, "index"),
+	};
+	try {
+		await execFile("git", ["read-tree", "HEAD"], {
+			cwd: directory,
+			env: environment,
+		});
+		await execFile("git", ["add", "-A", "--", "."], {
+			cwd: directory,
+			env: environment,
+		});
+		return (
+			await execFile("git", ["write-tree"], {
+				cwd: directory,
+				env: environment,
+			})
+		).stdout.trim();
+	} finally {
+		await rm(temporaryDirectory, { recursive: true, force: true });
+	}
+}
+
+async function repositoryDiff(directory: string, before: string) {
+	const after = await repositorySnapshot(directory);
+	return (
+		await execFile(
+			"git",
+			["diff", "--no-ext-diff", "--no-color", "--binary", before, after],
+			{ cwd: directory, maxBuffer: 10 * 1024 * 1024 },
+		)
+	).stdout;
 }
 
 function finalizationControl(control: string) {
@@ -470,11 +640,15 @@ export async function runDeliberation(
 		adapter = deterministicFakeAdapter,
 		now = () => new Date().toISOString(),
 		onEvent,
+		onAssignmentProposal,
 		signal,
 	}: {
 		adapter?: CouncilAdapter;
 		now?: () => string;
 		onEvent?: (event: RuntimeEvent) => void;
+		onAssignmentProposal?: (
+			proposal: AssignmentProposal,
+		) => AssignmentDecision | Promise<AssignmentDecision>;
 		signal?: AbortSignal;
 	} = {},
 ): Promise<RuntimeEvent[]> {
@@ -521,8 +695,12 @@ export async function runDeliberation(
 					entry.kind === "recommendation"),
 		);
 	const visibleContent = () =>
-		contributions().map(
-			(entry) => `@${entry.member} (${entry.kind}):\n${entry.content}`,
+		session.timeline.flatMap((entry) =>
+			entry.deliberationId === deliberation.id && entry.kind !== "question"
+				? [
+						`${"member" in entry ? `@${entry.member}` : "Council"} (${entry.kind}):\n${entry.content}`,
+					]
+				: [],
 		);
 	const collectContribution = async (
 		kind: CouncilPhase,
@@ -642,7 +820,7 @@ export async function runDeliberation(
 		let malformedControl: string | undefined;
 		let validationError: string | undefined;
 		for (let attempt = 0; attempt < 2; attempt += 1) {
-			const control = await call(() =>
+			const response = await call(() =>
 				adapter.control({
 					phase,
 					chair,
@@ -650,15 +828,22 @@ export async function runDeliberation(
 					question,
 					round,
 					priorContent: visibleContent(),
+					providerSessionReference:
+						deliberation.providerSessionReferences[chair.handle],
 					malformedControl,
 					validationError,
 				}),
 			);
+			const result =
+				typeof response === "string" ? { content: response } : response;
+			if (result.providerSessionReference)
+				deliberation.providerSessionReferences[chair.handle] =
+					result.providerSessionReference;
 			try {
-				return parse(control);
+				return parse(result.content);
 			} catch (error) {
 				if (attempt === 1) throw error;
-				malformedControl = control as string;
+				malformedControl = result.content;
 				validationError =
 					error instanceof Error ? error.message : "invalid Chair control";
 			}
@@ -711,14 +896,151 @@ export async function runDeliberation(
 	}
 
 	try {
+		let assignmentProposed = false;
 		for (let round = 1; round <= deliberationBudget.openRounds; round += 1) {
-			const roundMembers = await getControl("round", round, (value) =>
-				roundControl(value, participants),
+			const action = await getControl("round", round, (value) =>
+				roundControl(value, participants, session.council.members),
 			);
-			if (roundMembers.length === 0) break;
+			if (action.kind === "draft-recommendation") break;
+			if (action.kind === "propose-assignment") {
+				if (assignmentProposed)
+					throw new Error("A Deliberation may propose only one Assignment");
+				assignmentProposed = true;
+				const proposal: AssignmentProposal = {
+					member: action.member,
+					goal: action.goal,
+					expectedFiles: action.expectedFiles,
+				};
+				const proposedAt = now();
+				const proposalEntry: Extract<
+					TimelineEntry,
+					{ kind: "assignment-proposal" }
+				> = {
+					kind: "assignment-proposal",
+					deliberationId: deliberation.id,
+					...proposal,
+					content: `Assignment proposed for @${proposal.member}\nGoal: ${proposal.goal}\nExpected files:\n${proposal.expectedFiles.map((file) => `- ${file}`).join("\n")}`,
+					createdAt: proposedAt,
+				};
+				session.timeline.push(proposalEntry);
+				emit({ kind: "content", entry: proposalEntry });
+				const decision = (await onAssignmentProposal?.(proposal)) ?? "rejected";
+				const decidedAt = now();
+				const decisionEntry: Extract<
+					TimelineEntry,
+					{ kind: "assignment-decision" }
+				> = {
+					kind: "assignment-decision",
+					deliberationId: deliberation.id,
+					member: proposal.member,
+					decision,
+					content: `Assignment ${decision} for @${proposal.member}.`,
+					createdAt: decidedAt,
+				};
+				session.timeline.push(decisionEntry);
+				emit({ kind: "content", entry: decisionEntry });
+				if (decision === "rejected") continue;
+				if (assignmentActive)
+					throw new Error("Another approved Assignment is already writing");
+				assignmentActive = true;
+				const member = session.council.members.find(
+					(candidate) => candidate.handle === proposal.member,
+				) as SessionMember;
+				emit({
+					kind: "member-status",
+					member: member.handle,
+					status: "working",
+				});
+				try {
+					const before = await repositorySnapshot(session.workingDirectory);
+					const recordArtifact = (
+						content: string,
+						diff: string,
+						source?: CouncilSource,
+					) => {
+						const artifact: Extract<TimelineEntry, { kind: "artifact" }> = {
+							kind: "artifact",
+							deliberationId: deliberation.id,
+							member: member.handle,
+							content,
+							diff,
+							expectedFiles: proposal.expectedFiles,
+							approval: { decision: "approved", decidedAt },
+							createdAt: now(),
+							...(source ? { source } : {}),
+						};
+						session.timeline.push(artifact);
+						emit({ kind: "content", entry: artifact });
+					};
+					let typing = false;
+					let result: {
+						content: string;
+						providerSessionReference?: string;
+						source?: CouncilSource;
+					};
+					try {
+						const response = await call(() =>
+							adapter.respond({
+								phase: "assignment",
+								member,
+								question,
+								priorContent: visibleContent(),
+								assignment: proposal,
+								workingDirectory: session.workingDirectory,
+								providerSessionReference:
+									deliberation.providerSessionReferences[member.handle],
+								signal,
+								onPartial() {
+									if (typing) return;
+									typing = true;
+									emit({
+										kind: "member-status",
+										member: member.handle,
+										status: "typing",
+									});
+								},
+							}),
+						);
+						result =
+							typeof response === "string" ? { content: response } : response;
+						if (result.content.trim().length === 0)
+							throw new Error("Artifact description must be non-empty");
+					} catch (error) {
+						const diff = await repositoryDiff(session.workingDirectory, before);
+						if (diff)
+							recordArtifact(
+								`Assignment failed after modifying the workspace: ${error instanceof Error ? error.message : "unknown error"}`,
+								diff,
+								error instanceof CouncilAdapterError ? error.source : undefined,
+							);
+						emit({
+							kind: "member-status",
+							member: member.handle,
+							status: "failed",
+						});
+						throw error;
+					}
+					if (result.providerSessionReference)
+						deliberation.providerSessionReferences[member.handle] =
+							result.providerSessionReference;
+					recordArtifact(
+						result.content,
+						await repositoryDiff(session.workingDirectory, before),
+						result.source,
+					);
+					emit({
+						kind: "member-status",
+						member: member.handle,
+						status: "completed",
+					});
+				} finally {
+					assignmentActive = false;
+				}
+				continue;
+			}
 			const priorContent = visibleContent();
 			await Promise.allSettled(
-				roundMembers.map((handle) =>
+				action.members.map((handle) =>
 					collectContribution(
 						"round",
 						participants.find(

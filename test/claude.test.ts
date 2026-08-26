@@ -20,7 +20,7 @@ import {
 } from "../src/session.js";
 
 const fixtureSource = `#!/usr/bin/env node
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const directory = path.dirname(process.argv[1]);
@@ -34,6 +34,15 @@ const valueAfter = (flag) => {
 };
 const sessionId = valueAfter("--resume") ?? "11111111-1111-4111-8111-111111111111";
 const tools = (valueAfter("--tools") ?? "").split(",").filter(Boolean);
+const attemptTool = (name, action) => {
+  if (!tools.includes(name)) return "blocked";
+  action();
+  return "succeeded";
+};
+if (tools.includes("Write")) log({ boundaryAttempts: {
+  write: attemptTool("Write", () => writeFileSync(path.join(process.cwd(), "claude-assignment.txt"), "written without web tools")),
+  network: attemptTool("WebFetch", () => { throw new Error("network unexpectedly allowed"); })
+} });
 log({
   cwd: process.cwd(),
   argv: args,
@@ -66,12 +75,13 @@ if (mode === "malformed") {
 } else if (mode === "failure") {
   send({ type: "result", subtype: "error_during_execution", is_error: true, session_id: sessionId, result: "fixture rejected" });
 } else {
-  send({
+	const content = args.at(-1).includes("Direct the next Council step") ? (mode === "assignment-control" ? '{"kind":"propose-assignment","member":"researcher","goal":"Create proof","expectedFiles":["proof.txt"]}' : '{"kind":"draft-recommendation"}') : "Fixture Position";
+	send({
     type: "stream_event",
     session_id: sessionId,
     event: { type: "content_block_delta", delta: { type: "text_delta", text: "Fixture" } }
   });
-  send({ type: "result", subtype: "success", is_error: false, session_id: sessionId, result: "Fixture Position" });
+	  send({ type: "result", subtype: "success", is_error: false, session_id: sessionId, result: content });
 }
 
 process.on("SIGTERM", () => {
@@ -144,7 +154,9 @@ test("runs a Claude Position with inherited auth environment and enforced bounda
 			source: { provider: "claude", transport: "print-mode" },
 		});
 		assert.deepEqual(statuses, ["typing"]);
-		const [invocation] = await server.messages();
+		const invocation = (await server.messages()).find(
+			(message) => message.argv,
+		);
 		assert.equal(invocation?.cwd, await realpath(server.directory));
 		assert.equal(invocation?.inherited, "inherited");
 		assert.equal(invocation?.disableClaudeMds, undefined);
@@ -190,6 +202,95 @@ test("runs a Claude Position with inherited auth environment and enforced bounda
 			if (value === undefined) delete process.env[name];
 			else process.env[name] = value;
 		}
+		await server.remove();
+	}
+});
+
+test("runs an approved Claude Assignment with write tools and no web tools", async () => {
+	const server = await fixture();
+	try {
+		await createClaudeCouncilAdapter({
+			command: server.command,
+			workingDirectory: server.directory,
+		}).respond({
+			phase: "assignment",
+			member,
+			question: "Can we prove it?",
+			priorContent: [],
+			assignment: {
+				member: member.handle,
+				goal: "Create proof",
+				expectedFiles: ["proof.txt"],
+			},
+			workingDirectory: server.directory,
+			onPartial() {},
+		});
+
+		const invocation = (await server.messages()).find(
+			(message) => message.argv,
+		);
+		const argv = invocation?.argv as string[];
+		assert.equal(
+			argv[argv.indexOf("--tools") + 1],
+			"Read,Glob,Grep,Edit,Write",
+		);
+		assert.equal(argv[argv.indexOf("--permission-mode") + 1], "acceptEdits");
+		assert.doesNotMatch(argv.join(" "), /WebSearch|WebFetch/);
+		assert.match(argv.at(-1) ?? "", /Goal:\nCreate proof/);
+		assert.equal(
+			await readFile(
+				path.join(server.directory, "claude-assignment.txt"),
+				"utf8",
+			),
+			"written without web tools",
+		);
+		assert.deepEqual(
+			(await server.messages()).find((message) => message.boundaryAttempts)
+				?.boundaryAttempts,
+			{ write: "succeeded", network: "blocked" },
+		);
+	} finally {
+		await server.remove();
+	}
+});
+
+test("lets the Claude Chair propose an Assignment through native control", async () => {
+	const server = await fixture("assignment-control");
+	try {
+		const chair = { ...member, handle: "chair", role: "Chair" };
+		const adapter = createClaudeCouncilAdapter({
+			command: server.command,
+			workingDirectory: server.directory,
+		});
+		const request = {
+			phase: "round" as const,
+			chair,
+			members: [chair, member],
+			question: "Can we prove it?",
+			round: 1,
+			priorContent: [],
+		};
+		const control = await adapter.control(request);
+		assert.notEqual(typeof control, "string");
+		if (typeof control === "string")
+			throw new Error("Expected Claude response");
+		assert.deepEqual(JSON.parse(control.content), {
+			kind: "propose-assignment",
+			member: "researcher",
+			goal: "Create proof",
+			expectedFiles: ["proof.txt"],
+		});
+		await adapter.control({
+			...request,
+			round: 2,
+			providerSessionReference: control.providerSessionReference,
+		});
+		assert.ok(
+			(await server.messages()).some((invocation) =>
+				(invocation.argv as string[])?.includes("--resume"),
+			),
+		);
+	} finally {
 		await server.remove();
 	}
 });

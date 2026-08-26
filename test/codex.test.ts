@@ -20,7 +20,7 @@ import {
 import { validateConfiguration } from "../src/configuration.js";
 
 const fixtureSource = `#!/usr/bin/env node
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 
@@ -35,21 +35,33 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 	const message = JSON.parse(line);
 	if (message.method === "initialize") send({ id: message.id, result: { userAgent: "fixture" } });
 	if (message.method === "thread/start" || message.method === "thread/resume") {
+		const writable = message.params.sandbox === "workspace-write";
 		send({ id: message.id, result: {
 			thread: { id: "codex-thread-1" },
 			cwd: process.cwd(),
 			instructionSources: [mode === "personal" ? path.join(process.cwd(), "..", "AGENTS.md") : path.join(process.cwd(), "AGENTS.md")],
 			approvalPolicy: "never",
-			sandbox: { type: "readOnly", networkAccess: false }
+			sandbox: { type: writable ? "workspaceWrite" : "readOnly", networkAccess: false, ...(writable ? { writableRoots: [process.cwd()] } : {}) }
 		} });
 	}
 	if (message.method === "turn/start") {
+		const policy = message.params.sandboxPolicy;
+		const attempt = (allowed, action) => {
+			if (!allowed) return "blocked";
+			action();
+			return "succeeded";
+		};
+		if (policy.type === "workspaceWrite") log({ boundaryAttempts: {
+			write: attempt(true, () => writeFileSync(path.join(process.cwd(), "codex-assignment.txt"), "written without network")),
+			network: attempt(policy.networkAccess === true, () => { throw new Error("network unexpectedly allowed"); })
+		} });
 		send({ id: message.id, result: { turn: { id: "turn-1" } } });
 		if (mode === "malformed") return process.stdout.write("not json\\n");
 		if (mode === "exit") return process.exit(7);
 		if (mode === "hang" || mode === "ignore-term") return;
+		const content = message.params.input[0].text.includes("Direct the next Council step") ? (mode === "assignment-control" ? '{"kind":"propose-assignment","member":"researcher","goal":"Create proof","expectedFiles":["proof.txt"]}' : '{"kind":"draft-recommendation"}') : "Fixture Position";
 		send({ method: "item/agentMessage/delta", params: { threadId: "codex-thread-1", turnId: "turn-1", itemId: "item-1", delta: "Fixture" } });
-		send({ method: "item/completed", params: { threadId: "codex-thread-1", turnId: "turn-1", item: { type: "agentMessage", id: "item-1", text: "Fixture Position", phase: "final_answer" } } });
+		send({ method: "item/completed", params: { threadId: "codex-thread-1", turnId: "turn-1", item: { type: "agentMessage", id: "item-1", text: content, phase: "final_answer" } } });
 		send({ method: "turn/completed", params: { threadId: "codex-thread-1", turn: { id: "turn-1", status: "completed", error: null } } });
 	}
 	if (message.method === "turn/interrupt") send({ id: message.id, result: {} });
@@ -252,6 +264,101 @@ test("runs a Codex Position with inherited auth environment and enforced boundar
 		});
 	} finally {
 		delete process.env.OPEN_AGENT_COUNCIL_FIXTURE;
+		await server.remove();
+	}
+});
+
+test("runs an approved Codex Assignment with repository writes and no network", async () => {
+	const server = await fixture();
+	try {
+		await createCodexCouncilAdapter({
+			command: server.command,
+			workingDirectory: server.directory,
+		}).respond({
+			phase: "assignment",
+			member,
+			question: "Can we prove it?",
+			priorContent: [],
+			assignment: {
+				member: member.handle,
+				goal: "Create proof",
+				expectedFiles: ["proof.txt"],
+			},
+			workingDirectory: server.directory,
+			onPartial() {},
+		});
+
+		const messages = await server.messages();
+		const start = messages.find((message) => message.method === "thread/start");
+		const startParams = start?.params as Record<string, unknown>;
+		assert.equal(startParams.sandbox, "workspace-write");
+		assert.deepEqual(
+			(startParams.config as Record<string, unknown>).web_search,
+			"disabled",
+		);
+		const turn = messages.find((message) => message.method === "turn/start");
+		const turnParams = turn?.params as Record<string, unknown>;
+		assert.deepEqual(turnParams.sandboxPolicy, {
+			type: "workspaceWrite",
+			writableRoots: [server.directory],
+			networkAccess: false,
+		});
+		assert.match(
+			(turnParams.input as { text: string }[])?.[0]?.text ?? "",
+			/Goal:\nCreate proof/,
+		);
+		assert.equal(
+			await readFile(
+				path.join(server.directory, "codex-assignment.txt"),
+				"utf8",
+			),
+			"written without network",
+		);
+		assert.deepEqual(
+			messages.find((message) => message.boundaryAttempts)?.boundaryAttempts,
+			{ write: "succeeded", network: "blocked" },
+		);
+	} finally {
+		await server.remove();
+	}
+});
+
+test("lets the Codex Chair propose an Assignment through native control", async () => {
+	const server = await fixture("assignment-control");
+	try {
+		const chair = { ...member, handle: "chair", role: "Chair" };
+		const adapter = createCodexCouncilAdapter({
+			command: server.command,
+			workingDirectory: server.directory,
+		});
+		const request = {
+			phase: "round" as const,
+			chair,
+			members: [chair, member],
+			question: "Can we prove it?",
+			round: 1,
+			priorContent: [],
+		};
+		const control = await adapter.control(request);
+		assert.notEqual(typeof control, "string");
+		if (typeof control === "string") throw new Error("Expected Codex response");
+		assert.deepEqual(JSON.parse(control.content), {
+			kind: "propose-assignment",
+			member: "researcher",
+			goal: "Create proof",
+			expectedFiles: ["proof.txt"],
+		});
+		await adapter.control({
+			...request,
+			round: 2,
+			providerSessionReference: control.providerSessionReference,
+		});
+		assert.ok(
+			(await server.messages()).some(
+				(message) => message.method === "thread/resume",
+			),
+		);
+	} finally {
 		await server.remove();
 	}
 });

@@ -82,6 +82,7 @@ async function terminate(
 async function assertBoundaries(
 	result: Record<string, unknown>,
 	workingDirectory: string,
+	writable: boolean,
 ) {
 	const repositoryDirectory = await realpath(workingDirectory);
 	const reportedDirectory = await realpath(String(result.cwd)).catch(() => "");
@@ -96,10 +97,26 @@ async function assertBoundaries(
 		);
 	}
 	const sandbox = result.sandbox as
-		| { type?: string; networkAccess?: boolean }
+		| { type?: string; networkAccess?: boolean; writableRoots?: unknown[] }
 		| undefined;
-	if (sandbox?.type !== "readOnly" || sandbox.networkAccess !== false) {
-		throw new Error("Codex App Server did not enforce read-only local access");
+	if (
+		sandbox?.type !== (writable ? "workspaceWrite" : "readOnly") ||
+		sandbox.networkAccess !== false
+	) {
+		throw new Error("Codex App Server did not enforce local access boundaries");
+	}
+	if (
+		writable &&
+		(!Array.isArray(sandbox.writableRoots) ||
+			!(
+				await Promise.all(
+					sandbox.writableRoots.map((root) =>
+						realpath(String(root)).catch(() => path.resolve(String(root))),
+					),
+				)
+			).includes(repositoryDirectory))
+	) {
+		throw new Error("Codex App Server did not grant repository write access");
 	}
 	const sources = result.instructionSources;
 	if (!Array.isArray(sources)) {
@@ -297,7 +314,9 @@ async function runCodex(
 			}),
 		);
 		child.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`);
-		const hasWeb = request.member.capabilities?.includes("web") ?? false;
+		const writable = request.phase === "assignment";
+		const hasWeb =
+			!writable && (request.member.capabilities?.includes("web") ?? false);
 		const config = {
 			web_search: hasWeb ? "live" : "disabled",
 			...(hasWeb ? { tools: { web_search: {} } } : {}),
@@ -317,7 +336,7 @@ async function runCodex(
 		};
 		const threadParams = {
 			cwd: request.workingDirectory,
-			sandbox: "read-only",
+			sandbox: writable ? "workspace-write" : "read-only",
 			approvalPolicy: "never",
 			config,
 			developerInstructions: request.member.profileContent,
@@ -332,7 +351,7 @@ async function runCodex(
 					})
 				: send("thread/start", threadParams),
 		);
-		await assertBoundaries(thread, request.workingDirectory);
+		await assertBoundaries(thread, request.workingDirectory, writable);
 		threadId = String((thread.thread as { id?: string } | undefined)?.id ?? "");
 		if (!threadId)
 			throw new Error("Codex App Server did not return a thread ID");
@@ -348,7 +367,13 @@ async function runCodex(
 				],
 				cwd: request.workingDirectory,
 				approvalPolicy: "never",
-				sandboxPolicy: { type: "readOnly", networkAccess: false },
+				sandboxPolicy: writable
+					? {
+							type: "workspaceWrite",
+							writableRoots: [request.workingDirectory],
+							networkAccess: false,
+						}
+					: { type: "readOnly", networkAccess: false },
 			}),
 		);
 		turnId = String((turn.turn as { id?: string } | undefined)?.id ?? "");
@@ -403,14 +428,32 @@ export function createCodexCouncilAdapter({
 	let codexMember: string | undefined;
 	return {
 		selectParticipants: fallback.selectParticipants,
-		control: fallback.control,
+		async control(request) {
+			if (request.chair.provider !== "codex") return fallback.control(request);
+			return runCodex(
+				{
+					phase: "round",
+					member: request.chair,
+					question: request.question,
+					priorContent: request.priorContent,
+					workingDirectory,
+					providerSessionReference: request.providerSessionReference,
+					onPartial() {},
+					control: request,
+				},
+				{ command, timeoutMs, terminationGraceMs },
+			);
+		},
 		respond(request) {
+			const assignment =
+				request.phase === "assignment" && request.member.provider === "codex";
 			if (
+				!assignment &&
 				request.member.provider === "codex" &&
 				request.member.role !== "Chair"
 			)
 				codexMember ??= request.member.handle;
-			if (request.member.handle !== codexMember)
+			if (!assignment && request.member.handle !== codexMember)
 				return fallback.respond(request);
 			if (
 				path.resolve(request.workingDirectory) !==

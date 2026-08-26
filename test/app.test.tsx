@@ -18,10 +18,10 @@ import {
 	runDeliberation,
 	saveSession,
 } from "../src/session.js";
+import { createTestRepository } from "./repository.js";
 
 const settle = (delay = 100) =>
 	new Promise((resolve) => setTimeout(resolve, delay));
-
 async function providerPath(directory: string, providers: string[]) {
 	const binDirectory = path.join(directory, "bin");
 	await mkdir(binDirectory);
@@ -91,6 +91,75 @@ test("starts a fresh Session with /new and runs a question", async () => {
 	assert.match(instance.frames.join(""), /YOU[\s\S]*Should we ship it\?/);
 	instance.unmount();
 	await rm(configurationDirectory, { recursive: true, force: true });
+});
+
+test("shows the complete Assignment proposal and diff only after explicit approval", async () => {
+	const configurationDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-"),
+	);
+	const workingDirectory = await createTestRepository();
+	await createEngineeringCouncil(configurationDirectory, "codex");
+	let round = 0;
+	const instance = render(
+		createElement(App, {
+			workingDirectory,
+			configurationDirectory,
+			availableProviders: ["codex"],
+			adapter: {
+				...deterministicFakeAdapter,
+				control({ phase }) {
+					if (phase === "round" && round++ === 0)
+						return JSON.stringify({
+							kind: "propose-assignment",
+							member: "prototyper",
+							goal: "Create runnable proof",
+							expectedFiles: ["proof.txt"],
+						});
+					return deterministicFakeAdapter.control({ phase } as never);
+				},
+				async respond(request) {
+					if (request.phase !== "assignment")
+						return deterministicFakeAdapter.respond(request);
+					await writeFile(path.join(workingDirectory, "proof.txt"), "proof\n");
+					await writeFile(path.join(workingDirectory, "extra.txt"), "extra\n");
+					return "Runnable proof created.";
+				},
+			},
+		}),
+	);
+	await settle();
+	instance.stdin.write("/new");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("Can we prove it?");
+	await settle();
+	instance.stdin.write("\r");
+	await settle(300);
+
+	assert.match(instance.lastFrame() ?? "", /Assignment proposal/);
+	assert.match(instance.lastFrame() ?? "", /@prototyper/);
+	assert.match(instance.lastFrame() ?? "", /Create runnable proof/);
+	assert.match(instance.lastFrame() ?? "", /proof\.txt/);
+	await assert.rejects(access(path.join(workingDirectory, "proof.txt")));
+	instance.stdin.write("\x1B[B");
+	instance.stdin.write("\r");
+	await settle(500);
+
+	assert.match(instance.frames.join(""), /Runnable proof created/);
+	assert.match(instance.frames.join(""), /extra\.txt/);
+	const [metadata] = await loadSessionMetadata(configurationDirectory);
+	assert.ok(metadata);
+	assert.ok(
+		(await loadSession(configurationDirectory, metadata.id)).timeline.some(
+			(entry) => entry.kind === "artifact" && /extra\.txt/.test(entry.diff),
+		),
+	);
+	instance.unmount();
+	await rm(configurationDirectory, { recursive: true, force: true });
+	await rm(workingDirectory, { recursive: true, force: true });
 });
 
 test("selects a configured Council and exposes configuration commands", async () => {
