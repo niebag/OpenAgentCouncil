@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { render } from "ink";
 import { App } from "./app.js";
+import { abortOnShutdown } from "./shutdown.js";
 
 if (!process.stdin.isTTY || !process.stdout.isTTY) {
 	console.error(
@@ -8,5 +9,8 @@ if (!process.stdin.isTTY || !process.stdout.isTTY) {
 	);
 	process.exitCode = 1;
 } else {
-	render(<App workingDirectory={process.cwd()} />, { exitOnCtrlC: false });
+	const app = render(<App workingDirectory={process.cwd()} />, {
+		exitOnCtrlC: false,
+	});
+	abortOnShutdown(app.unmount);
 }

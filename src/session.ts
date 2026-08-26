@@ -10,7 +10,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import path from "node:path";
-import type { Council, Member } from "./configuration.js";
+import type { Council, Member, Provider } from "./configuration.js";
 
 type SessionMember = Member & { profileContent: string };
 
@@ -28,6 +28,7 @@ type ContributionEntry = {
 		member: string;
 		content: string;
 		createdAt: string;
+		source?: CouncilSource;
 	};
 }[CouncilPhase];
 
@@ -46,6 +47,8 @@ export type TimelineEntry =
 			phase: CouncilPhase;
 			content: string;
 			createdAt: string;
+			source?: CouncilSource;
+			outcome?: CouncilFailureOutcome;
 	  }
 	| {
 			kind: "incomplete-deliberation";
@@ -86,13 +89,49 @@ export type RuntimeEvent =
 			member: string;
 			status: "working" | "typing" | "completed" | "failed";
 	  }
-	| { kind: "content"; entry: Exclude<TimelineEntry, { kind: "question" }> };
+	| { kind: "content"; entry: Exclude<TimelineEntry, { kind: "question" }> }
+	| {
+			kind: "provider-outcome";
+			member: string;
+			outcome: CouncilFailureOutcome;
+			source?: CouncilSource;
+			error: string;
+	  };
 
-type CouncilRequest = {
+export type CouncilSource = {
+	provider: Provider;
+	transport: "app-server" | "print-mode";
+	nativeReference?: string;
+};
+
+export type CouncilFailureOutcome = "failed" | "cancelled" | "timed-out";
+
+export class CouncilAdapterError extends Error {
+	constructor(
+		message: string,
+		readonly outcome: CouncilFailureOutcome,
+		readonly source: CouncilSource,
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+	}
+}
+
+export type CouncilResponse = {
+	content: string;
+	providerSessionReference?: string;
+	source: CouncilSource;
+};
+
+export type CouncilRequest = {
 	phase: CouncilPhase;
 	member: SessionMember;
 	question: string;
 	priorContent: string[];
+	workingDirectory: string;
+	providerSessionReference?: string;
+	signal?: AbortSignal;
+	onPartial: () => void;
 };
 
 type CouncilControlRequest = {
@@ -115,7 +154,9 @@ export type CouncilAdapter = {
 		malformedControl?: string;
 	}): string | Promise<string>;
 	control(request: CouncilControlRequest): string | Promise<string>;
-	respond(request: CouncilRequest): string | Promise<string>;
+	respond(
+		request: CouncilRequest,
+	): string | CouncilResponse | Promise<string | CouncilResponse>;
 };
 
 const deliberationBudget = { openRounds: 2, providerCalls: 20 } as const;
@@ -472,22 +513,56 @@ export async function runDeliberation(
 		validate?: (content: string) => void,
 	) => {
 		emit({ kind: "member-status", member: member.handle, status: "working" });
-		emit({ kind: "member-status", member: member.handle, status: "typing" });
+		let typing = false;
+		const onPartial = () => {
+			if (typing) return;
+			typing = true;
+			emit({ kind: "member-status", member: member.handle, status: "typing" });
+		};
 		try {
-			const content = await call(() =>
-				adapter.respond({ phase: kind, member, question, priorContent }),
+			const response = await call(() =>
+				adapter.respond({
+					phase: kind,
+					member,
+					question,
+					priorContent,
+					workingDirectory: session.workingDirectory,
+					providerSessionReference:
+						deliberation.providerSessionReferences[member.handle],
+					signal,
+					onPartial,
+				}),
 			);
 			signal?.throwIfAborted();
+			const result: {
+				content: string;
+				providerSessionReference?: string;
+				source?: CouncilSource;
+			} = typeof response === "string" ? { content: response } : response;
+			const { content } = result;
 			if (content.trim().length === 0) {
 				throw new Error(`${kind} content must be non-empty`);
 			}
+			onPartial();
 			validate?.(content);
+			if (result.providerSessionReference) {
+				deliberation.providerSessionReferences[member.handle] =
+					result.providerSessionReference;
+			}
 			const entry = {
 				kind,
 				deliberationId: deliberation.id,
 				member: member.handle,
 				content,
 				createdAt: now(),
+				...(result.source
+					? {
+							source: {
+								...result.source,
+								nativeReference: result.providerSessionReference,
+							},
+						}
+					: {}),
 			} as Extract<TimelineEntry, { kind: CouncilPhase }>;
 			session.timeline.push(entry);
 			emit({ kind: "content", entry });
@@ -498,14 +573,27 @@ export async function runDeliberation(
 			});
 			return entry;
 		} catch (error) {
+			const adapterError =
+				error instanceof CouncilAdapterError ? error : undefined;
+			const message = error instanceof Error ? error.message : "unknown error";
+			emit({
+				kind: "provider-outcome",
+				member: member.handle,
+				outcome:
+					adapterError?.outcome ?? (signal?.aborted ? "cancelled" : "failed"),
+				source: adapterError?.source,
+				error: message,
+			});
 			if (signal?.aborted) throw error;
 			const entry: Extract<TimelineEntry, { kind: "member-failure" }> = {
 				kind: "member-failure",
 				deliberationId: deliberation.id,
 				member: member.handle,
 				phase: kind,
-				content: `${member.handle} failed during ${kind}: ${error instanceof Error ? error.message : "unknown error"}`,
+				content: `${member.handle} failed during ${kind}: ${message}`,
 				createdAt: now(),
+				source: adapterError?.source,
+				outcome: adapterError?.outcome,
 			};
 			session.timeline.push(entry);
 			emit({ kind: "content", entry });

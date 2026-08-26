@@ -65,6 +65,7 @@ test("starts a fresh Session with /new and runs a question", async () => {
 			workingDirectory: "/tmp/council-workspace",
 			configurationDirectory,
 			availableProviders: ["codex"],
+			adapter: deterministicFakeAdapter,
 		}),
 	);
 	await settle();
@@ -252,6 +253,7 @@ test("resumes a saved Session and removes it only after confirmation", async () 
 			workingDirectory,
 			configurationDirectory,
 			availableProviders: ["codex"],
+			adapter: deterministicFakeAdapter,
 		}),
 	);
 	await settle();

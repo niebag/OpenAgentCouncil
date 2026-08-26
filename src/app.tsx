@@ -19,6 +19,7 @@ import {
 	type Provider,
 	type ResolvedConfiguration,
 } from "./configuration.js";
+import { createCodexCouncilAdapter } from "./codex.js";
 import {
 	createSession,
 	loadSession,
@@ -243,6 +244,7 @@ function CouncilScreen({
 	const textareaRef = useRef<TextAreaHandle>(null);
 	const runId = useRef(0);
 	const abortController = useRef<AbortController | undefined>(undefined);
+	useEffect(() => () => abortController.current?.abort(), []);
 	const narrow = columns < 72;
 	const council =
 		session?.council ??
@@ -717,6 +719,9 @@ export function App({
 	const [providers] = useState(
 		() => availableProviders ?? detectProviders(pathValue),
 	);
+	const [productionAdapter] = useState(() =>
+		createCodexCouncilAdapter({ workingDirectory }),
+	);
 	const [configuration, setConfiguration] = useState<Configuration>();
 	const [recentSessions, setRecentSessions] = useState<SessionMetadata[]>([]);
 	const [loading, setLoading] = useState(true);
@@ -772,7 +777,7 @@ export function App({
 				configuration={configuration}
 				configurationDirectory={directory}
 				recentSessions={recentSessions}
-				adapter={adapter}
+				adapter={adapter ?? productionAdapter}
 				onReloadConfiguration={reloadConfiguration}
 				onReloadSessions={reloadSessions}
 				onOpenConfiguration={openConfigurationOverride ?? openConfiguration}
