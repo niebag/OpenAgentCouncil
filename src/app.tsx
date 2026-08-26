@@ -11,6 +11,15 @@ import {
 	type Member,
 	type Provider,
 } from "./configuration.js";
+import {
+	createSession,
+	loadSessionMetadata,
+	readProfileContents,
+	runDeliberation,
+	saveSession,
+	type Session,
+	type SessionMetadata,
+} from "./session.js";
 
 const memberStyle: Record<Member["role"], { color: string; glyph: string }> = {
 	Chair: { color: "yellow", glyph: "◆" },
@@ -19,7 +28,13 @@ const memberStyle: Record<Member["role"], { color: string; glyph: string }> = {
 	Prototyper: { color: "green", glyph: "■" },
 };
 
-function Roster({ members }: { members: Member[] }) {
+function Roster({
+	members,
+	statuses,
+}: {
+	members: Member[];
+	statuses: Record<string, "waiting" | "working" | "completed">;
+}) {
 	return (
 		<Box
 			flexDirection="column"
@@ -38,7 +53,7 @@ function Roster({ members }: { members: Member[] }) {
 						<Text color={style.color}>
 							{style.glyph} {member.role}{" "}
 						</Text>
-						<Badge color="white">waiting</Badge>
+						<Badge color="white">{statuses[member.handle] ?? "waiting"}</Badge>
 					</Box>
 				);
 			})}
@@ -49,16 +64,87 @@ function Roster({ members }: { members: Member[] }) {
 function CouncilScreen({
 	workingDirectory,
 	configuration,
+	configurationDirectory,
+	recentSessions,
 }: {
 	workingDirectory: string;
 	configuration: Configuration;
+	configurationDirectory: string;
+	recentSessions: SessionMetadata[];
 }) {
 	const { columns } = useWindowSize();
 	const [draft, setDraft] = useState("");
+	const [session, setSession] = useState<Session>();
+	const [choosingCouncil, setChoosingCouncil] = useState(false);
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState<string>();
+	const [statuses, setStatuses] = useState<
+		Record<string, "waiting" | "working" | "completed">
+	>({});
 	const textareaRef = useRef<TextAreaHandle>(null);
 	const narrow = columns < 72;
 	const council = configuration.councils[0];
 	if (!council) return null;
+	const startSession = async (
+		selectedCouncil: Configuration["councils"][number],
+	) => {
+		try {
+			const nextSession = createSession({
+				council: selectedCouncil,
+				workingDirectory,
+				profileContents: await readProfileContents(
+					configurationDirectory,
+					selectedCouncil,
+				),
+			});
+			await saveSession(configurationDirectory, nextSession);
+			setSession(nextSession);
+			setStatuses({});
+			setChoosingCouncil(false);
+			setError(undefined);
+		} catch (error) {
+			setError(
+				error instanceof Error ? error.message : "Could not start Session",
+			);
+		}
+	};
+	const submit = async () => {
+		const question = draft.trim();
+		setDraft("");
+		if (question === "/new") {
+			setChoosingCouncil(true);
+			return;
+		}
+		if (!question) return;
+		if (!session) {
+			setError("Start a new Session with /new.");
+			return;
+		}
+		try {
+			setBusy(true);
+			await runDeliberation(session, question, {
+				onEvent: (event) => {
+					if (event.kind === "member-status") {
+						setStatuses((current) => ({
+							...current,
+							[event.member]: event.status,
+						}));
+					} else {
+						setSession({ ...session });
+					}
+				},
+			});
+			await saveSession(configurationDirectory, session);
+			setSession({ ...session });
+			setError(undefined);
+		} catch (error) {
+			setError(
+				error instanceof Error ? error.message : "Could not run Deliberation",
+			);
+		} finally {
+			setBusy(false);
+		}
+	};
 
 	return (
 		<Box flexDirection="column" width="100%">
@@ -74,23 +160,60 @@ function CouncilScreen({
 				borderColor="gray"
 				marginY={1}
 			>
-				<Roster members={council.members} />
+				<Roster members={council.members} statuses={statuses} />
 				<Box flexDirection="column" flexGrow={1} paddingX={1}>
 					<Text bold color="blue">
 						MESSAGE THE COUNCIL
 					</Text>
-					<TextArea
-						ref={textareaRef}
-						focus
-						value={draft}
-						onChange={setDraft}
-						onSubmit={() => setDraft("")}
-						placeholder="Message the Council, @mention a member, or type a command"
-						initialLineCount={2}
-						viewportLines={4}
-						disableCursorBlink
-						linePrefix={<Text color="cyan">❯ </Text>}
-					/>
+					{choosingCouncil ? (
+						<Box flexDirection="column">
+							<Text>Choose a Council for this new Session.</Text>
+							<Select
+								options={configuration.councils.map((council) => ({
+									label: council.name,
+									value: council.name,
+								}))}
+								onChange={(name) => {
+									const selectedCouncil = configuration.councils.find(
+										(council) => council.name === name,
+									);
+									if (selectedCouncil) void startSession(selectedCouncil);
+								}}
+							/>
+						</Box>
+					) : (
+						<TextArea
+							ref={textareaRef}
+							focus
+							value={draft}
+							onChange={setDraft}
+							onSubmit={() => void submit()}
+							placeholder="Type /new to start a Session, then ask a concrete question"
+							initialLineCount={2}
+							viewportLines={4}
+							disableCursorBlink
+							linePrefix={<Text color="cyan">❯ </Text>}
+						/>
+					)}
+					{session && (
+						<Text dimColor>Session started: {session.council.name}</Text>
+					)}
+					{busy && <Text color="yellow">Deliberating…</Text>}
+					{recentSessions.length > 0 && !session && (
+						<Text dimColor>
+							{recentSessions.length} saved Session(s) available.
+						</Text>
+					)}
+					{session?.timeline
+						.filter((entry) => entry.kind !== "question")
+						.map((entry) => (
+							<Text
+								key={`${entry.deliberationId}-${entry.kind}-${"member" in entry ? entry.member : ""}`}
+							>
+								{entry.kind}: {entry.content}
+							</Text>
+						))}
+					{error && <StatusMessage variant="error">{error}</StatusMessage>}
 				</Box>
 			</Box>
 		</Box>
@@ -156,12 +279,19 @@ export function App({
 		() => availableProviders ?? detectProviders(pathValue),
 	);
 	const [configuration, setConfiguration] = useState<Configuration>();
+	const [recentSessions, setRecentSessions] = useState<SessionMetadata[]>([]);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string>();
 
 	useEffect(() => {
-		loadConfiguration(directory, providers)
-			.then(setConfiguration)
+		Promise.all([
+			loadConfiguration(directory, providers),
+			loadSessionMetadata(directory),
+		])
+			.then(([configuration, sessions]) => {
+				setConfiguration(configuration);
+				setRecentSessions(sessions);
+			})
 			.catch((error: unknown) => {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 					setError(
@@ -181,6 +311,8 @@ export function App({
 			<CouncilScreen
 				workingDirectory={workingDirectory}
 				configuration={configuration}
+				configurationDirectory={directory}
+				recentSessions={recentSessions}
 			/>
 		);
 	}

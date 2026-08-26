@@ -46,6 +46,42 @@ test("renders the production Council screen and caller directory", async () => {
 	await rm(configurationDirectory, { recursive: true, force: true });
 });
 
+test("starts a fresh Session with /new and runs a question", async () => {
+	const configurationDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-"),
+	);
+	await createEngineeringCouncil(configurationDirectory, "codex");
+	const instance = render(
+		createElement(App, {
+			workingDirectory: "/tmp/council-workspace",
+			configurationDirectory,
+			availableProviders: ["codex"],
+		}),
+	);
+	await settle();
+	instance.stdin.write("/new");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	assert.match(instance.lastFrame() ?? "", /Choose a Council/);
+	instance.stdin.write("\r");
+	await settle();
+	assert.match(
+		instance.lastFrame() ?? "",
+		/Session started: Engineering Council/,
+	);
+	instance.stdin.write("Should we ship it?");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	assert.match(
+		instance.lastFrame() ?? "",
+		/Recommendation for “Should we ship it\?”/,
+	);
+	instance.unmount();
+	await rm(configurationDirectory, { recursive: true, force: true });
+});
+
 test("onboards a Codex Engineering Council and saves its Member Profiles", async () => {
 	const configurationDirectory = await mkdtemp(
 		path.join(os.tmpdir(), "openagentcouncil-"),

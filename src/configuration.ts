@@ -14,8 +14,10 @@ export type Member = {
 
 export type Configuration = {
 	version: 1;
-	councils: Array<{ name: string; members: Member[] }>;
+	councils: Council[];
 };
+
+export type Council = { name: string; members: Member[] };
 
 const configurationFile = "council.json";
 
