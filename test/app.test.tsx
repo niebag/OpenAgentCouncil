@@ -10,6 +10,12 @@ import {
 	createEngineeringCouncil,
 	loadConfiguration,
 } from "../src/configuration.js";
+import {
+	createSession,
+	loadSession,
+	runDeliberation,
+	saveSession,
+} from "../src/session.js";
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
 
@@ -213,6 +219,105 @@ test("onboards a Codex Engineering Council and saves its Member Profiles", async
 	);
 	await rm(configurationDirectory, { recursive: true, force: true });
 	instance.unmount();
+});
+
+test("resumes a saved Session and removes it only after confirmation", async () => {
+	const configurationDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-"),
+	);
+	const workingDirectory = "/tmp/saved-council-workspace";
+	await createEngineeringCouncil(configurationDirectory, "codex");
+	const [council] = (await loadConfiguration(configurationDirectory, ["codex"]))
+		.councils;
+	if (!council) throw new Error("Engineering Council fixture is required");
+	const saved = createSession({
+		council,
+		workingDirectory,
+		profileContents: {
+			"profiles/chair.md": "Saved Chair profile",
+			"profiles/researcher.md": "Saved Researcher profile",
+			"profiles/critic.md": "Saved Critic profile",
+			"profiles/prototyper.md": "Saved Prototyper profile",
+		},
+	});
+	await runDeliberation(saved, "Revisit the original decision");
+	await saveSession(configurationDirectory, saved);
+	await rm(path.join(configurationDirectory, "council.json"));
+	const instance = render(
+		createElement(App, {
+			workingDirectory,
+			configurationDirectory,
+			availableProviders: ["codex"],
+		}),
+	);
+	await settle();
+	instance.stdin.write("/resume");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	assert.match(instance.lastFrame() ?? "", /Choose a saved Session to resume/);
+	assert.match(instance.lastFrame() ?? "", /Engineering Council/);
+	assert.match(instance.lastFrame() ?? "", /saved-council-workspace/);
+	assert.match(instance.lastFrame() ?? "", /Latest: Revisit the/);
+	assert.match(instance.lastFrame() ?? "", /original decision/);
+	instance.stdin.write("\r");
+	await settle();
+	assert.match(
+		instance.lastFrame() ?? "",
+		/Session started: Engineering Council/,
+	);
+	instance.stdin.write("What should happen next?");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	assert.equal(
+		(await loadSession(configurationDirectory, saved.id)).deliberations.length,
+		2,
+	);
+	assert.equal(
+		(await loadSession(configurationDirectory, saved.id)).council.members[0]
+			?.profileContent,
+		"Saved Chair profile",
+	);
+	instance.unmount();
+
+	await createEngineeringCouncil(configurationDirectory, "codex");
+	const removal = render(
+		createElement(App, {
+			workingDirectory,
+			configurationDirectory,
+			availableProviders: ["codex"],
+		}),
+	);
+	await settle();
+	removal.stdin.write("/remove");
+	await settle();
+	removal.stdin.write("\r");
+	await settle();
+	assert.match(removal.lastFrame() ?? "", /Choose a saved Session to remove/);
+	removal.stdin.write("\r");
+	await settle();
+	assert.match(removal.lastFrame() ?? "", /Remove this saved Session/);
+	removal.stdin.write("\r");
+	await settle();
+	assert.equal(
+		(await loadSession(configurationDirectory, saved.id)).id,
+		saved.id,
+	);
+	removal.stdin.write("/remove");
+	await settle();
+	removal.stdin.write("\r");
+	await settle();
+	removal.stdin.write("\r");
+	await settle();
+	assert.match(removal.lastFrame() ?? "", /Remove this saved Session/);
+	removal.stdin.write("\x1B[B");
+	removal.stdin.write("\r");
+	await settle();
+	assert.match(removal.lastFrame() ?? "", /Removed saved Session/);
+	await assert.rejects(loadSession(configurationDirectory, saved.id));
+	removal.unmount();
+	await rm(configurationDirectory, { recursive: true, force: true });
 });
 
 test("does not create configuration when no supported CLI is available", async () => {

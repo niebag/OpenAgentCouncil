@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+	chmod,
+	mkdir,
+	mkdtemp,
+	readFile,
+	readdir,
+	rm,
+	stat,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,7 +20,9 @@ import {
 import {
 	createSession,
 	deterministicFakeAdapter,
+	loadSession,
 	loadSessionMetadata,
+	removeSession,
 	runDeliberation,
 	saveSession,
 } from "../src/session.js";
@@ -236,11 +248,183 @@ test("runs and persists a normalized fake Deliberation", async () => {
 			startedAt: "2026-08-26T12:00:00.000Z",
 			workingDirectory: "/tmp/workspace",
 			councilName: "Engineering Council",
+			deliberationCount: 1,
+			latestQuestion: "Should we ship it?",
 		},
 	]);
 	assert.equal(await readFile(file, "utf8"), before);
 	assert.deepEqual(await readdir(path.join(directory, "sessions")), [
 		`${session.id}.json`,
 	]);
+	await rm(directory, { recursive: true, force: true });
+});
+
+test("repairs Session permissions and removes only the selected Session record", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	await saveSession(directory, session);
+	const sessions = path.join(directory, "sessions");
+	const file = path.join(sessions, `${session.id}.json`);
+	await chmod(sessions, 0o755);
+	await chmod(file, 0o644);
+	await writeFile(path.join(directory, "council.json"), "unchanged");
+
+	assert.equal(
+		(await loadSessionMetadata(directory))[0]?.latestQuestion,
+		undefined,
+	);
+	assert.equal((await stat(sessions)).mode & 0o777, 0o700);
+	assert.equal((await stat(file)).mode & 0o777, 0o600);
+	await removeSession(directory, session.id);
+
+	assert.deepEqual(await readdir(sessions), []);
+	assert.equal(
+		await readFile(path.join(directory, "council.json"), "utf8"),
+		"unchanged",
+	);
+	await rm(directory, { recursive: true, force: true });
+});
+
+test("reports unsupported Session schemas without altering their files", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
+	const sessions = path.join(directory, "sessions");
+	const file = path.join(sessions, "future.json");
+	await mkdir(sessions, { mode: 0o700 });
+	await writeFile(file, '{"version":2}\n', { mode: 0o644 });
+	const before = await readFile(file, "utf8");
+
+	await assert.rejects(
+		loadSessionMetadata(directory),
+		/Unsupported Session schema version 2/,
+	);
+
+	assert.equal(await readFile(file, "utf8"), before);
+	assert.equal((await stat(file)).mode & 0o777, 0o644);
+	await rm(directory, { recursive: true, force: true });
+});
+
+test("rejects Session files whose record identity does not match their filename", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	await saveSession(directory, session);
+	await writeFile(
+		path.join(directory, "sessions", "mismatched.json"),
+		JSON.stringify(session),
+	);
+
+	await assert.rejects(
+		loadSessionMetadata(directory),
+		/Session file identity does not match its record/,
+	);
+	await rm(directory, { recursive: true, force: true });
+});
+
+test("refuses symlinked Session files without repairing their targets", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	const target = path.join(directory, "outside.json");
+	const file = path.join(directory, "sessions", `${session.id}.json`);
+	await mkdir(path.join(directory, "sessions"), { mode: 0o700 });
+	await writeFile(target, JSON.stringify(session), { mode: 0o644 });
+	await symlink(target, file);
+
+	await assert.rejects(
+		loadSession(directory, session.id),
+		/must be a regular file/,
+	);
+	assert.equal((await stat(target)).mode & 0o777, 0o644);
+	await rm(directory, { recursive: true, force: true });
+});
+
+test("ignores an interrupted temporary Session record", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	await saveSession(directory, session);
+	await writeFile(
+		path.join(directory, "sessions", `${session.id}.json.interrupted.tmp`),
+		"{",
+	);
+
+	assert.equal((await loadSession(directory, session.id)).id, session.id);
+	await rm(directory, { recursive: true, force: true });
+});
+
+test("loads legacy version 1 Sessions without provider references", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	await runDeliberation(session, "Should we ship it?");
+	await saveSession(directory, session);
+	const file = path.join(directory, "sessions", `${session.id}.json`);
+	const stored = JSON.parse(await readFile(file, "utf8")) as typeof session;
+	for (const deliberation of stored.deliberations) {
+		delete (deliberation as Partial<typeof deliberation>)
+			.providerSessionReferences;
+	}
+	await writeFile(file, `${JSON.stringify(stored)}\n`);
+
+	assert.deepEqual(
+		(await loadSession(directory, session.id)).deliberations[0]
+			?.providerSessionReferences,
+		{},
+	);
+	await rm(directory, { recursive: true, force: true });
+});
+
+test("resumes a persisted Session snapshot and saves continued Deliberations", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "openagentcouncil-"));
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {
+			"chair.md": "Original Chair profile",
+			"researcher.md": "Original Researcher profile",
+			"critic.md": "Original Critic profile",
+			"prototyper.md": "Original Prototyper profile",
+		},
+	});
+	await runDeliberation(session, "Should we ship it?");
+	const [deliberation] = session.deliberations;
+	if (!deliberation) throw new Error("Deliberation fixture is required");
+	deliberation.providerSessionReferences.researcher =
+		"fixture-provider-session";
+	await saveSession(directory, session);
+
+	const resumed = await loadSession(directory, session.id);
+	assert.deepEqual(
+		resumed,
+		JSON.parse(JSON.stringify(session)) as typeof session,
+	);
+	assert.equal(
+		resumed.deliberations[0]?.providerSessionReferences.researcher,
+		"fixture-provider-session",
+	);
+	await runDeliberation(resumed, "What should we do next?");
+	await saveSession(directory, resumed);
+
+	assert.equal(resumed.deliberations.length, 2);
+	assert.equal(
+		(await loadSession(directory, session.id)).timeline.at(-1)?.kind,
+		"recommendation",
+	);
 	await rm(directory, { recursive: true, force: true });
 });

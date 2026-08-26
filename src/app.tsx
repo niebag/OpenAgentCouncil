@@ -17,7 +17,9 @@ import {
 } from "./configuration.js";
 import {
 	createSession,
+	loadSession,
 	loadSessionMetadata,
+	removeSession,
 	runDeliberation,
 	saveSession,
 	type Session,
@@ -67,26 +69,39 @@ function Roster({
 	);
 }
 
+function sessionLabel(session: SessionMetadata) {
+	const context = session.latestQuestion
+		? `Latest: ${session.latestQuestion}`
+		: "No Deliberations";
+	return `${session.councilName} · ${session.workingDirectory} · ${session.startedAt} · ${session.deliberationCount} Deliberation(s) · ${context}`;
+}
+
 function CouncilScreen({
 	workingDirectory,
 	configuration,
 	configurationDirectory,
 	recentSessions,
 	onReloadConfiguration,
+	onReloadSessions,
 	onOpenConfiguration,
 }: {
 	workingDirectory: string;
-	configuration: Configuration;
+	configuration?: Configuration;
 	configurationDirectory: string;
 	recentSessions: SessionMetadata[];
 	onReloadConfiguration: () => Promise<ResolvedConfiguration>;
+	onReloadSessions: () => Promise<SessionMetadata[]>;
 	onOpenConfiguration: (file: string) => Promise<void>;
 }) {
 	const { columns } = useWindowSize();
 	const [draft, setDraft] = useState("");
 	const [session, setSession] = useState<Session>();
-	const [newSessionConfiguration, setNewSessionConfiguration] =
-		useState<ResolvedConfiguration>();
+	const [picker, setPicker] = useState<
+		| { kind: "new"; configuration: ResolvedConfiguration }
+		| { kind: "resume" }
+		| { kind: "remove" }
+	>();
+	const [sessionToRemove, setSessionToRemove] = useState<SessionMetadata>();
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string>();
 	const [notice, setNotice] = useState<string>();
@@ -95,9 +110,12 @@ function CouncilScreen({
 	>({});
 	const textareaRef = useRef<TextAreaHandle>(null);
 	const narrow = columns < 72;
-	const council = (newSessionConfiguration?.configuration ?? configuration)
-		.councils[0];
-	if (!council) return null;
+	const council =
+		session?.council ??
+		(picker?.kind === "new"
+			? picker.configuration.configuration
+			: configuration
+		)?.councils[0];
 	const startSession = async (
 		selectedCouncil: Configuration["councils"][number],
 		profileContents: Record<string, string>,
@@ -111,7 +129,7 @@ function CouncilScreen({
 			await saveSession(configurationDirectory, nextSession);
 			setSession(nextSession);
 			setStatuses({});
-			setNewSessionConfiguration(undefined);
+			setPicker(undefined);
 			setError(undefined);
 			setNotice(undefined);
 		} catch (error) {
@@ -120,12 +138,42 @@ function CouncilScreen({
 			);
 		}
 	};
+	const resumeSession = async (id: string) => {
+		try {
+			setSession(await loadSession(configurationDirectory, id));
+			setStatuses({});
+			setPicker(undefined);
+			setError(undefined);
+			setNotice(undefined);
+		} catch (error) {
+			setError(
+				error instanceof Error ? error.message : "Could not resume Session",
+			);
+		}
+	};
+	const confirmRemove = async () => {
+		if (!sessionToRemove) return;
+		try {
+			await removeSession(configurationDirectory, sessionToRemove.id);
+			await onReloadSessions();
+			setNotice(`Removed saved Session: ${sessionToRemove.councilName}`);
+			setSessionToRemove(undefined);
+			setError(undefined);
+		} catch (error) {
+			setError(
+				error instanceof Error ? error.message : "Could not remove Session",
+			);
+		}
+	};
 	const submit = async () => {
 		const question = draft.trim();
 		setDraft("");
 		if (question === "/new") {
 			try {
-				setNewSessionConfiguration(await onReloadConfiguration());
+				setPicker({
+					kind: "new",
+					configuration: await onReloadConfiguration(),
+				});
 				setError(undefined);
 			} catch (error) {
 				setError(
@@ -134,6 +182,24 @@ function CouncilScreen({
 						: "Could not load configuration",
 				);
 			}
+			return;
+		}
+		if (question === "/resume") {
+			if (recentSessions.length === 0) {
+				setNotice("No saved Sessions are available.");
+				return;
+			}
+			setPicker({ kind: "resume" });
+			setError(undefined);
+			return;
+		}
+		if (question === "/remove") {
+			if (recentSessions.length === 0) {
+				setNotice("No saved Sessions are available.");
+				return;
+			}
+			setPicker({ kind: "remove" });
+			setError(undefined);
 			return;
 		}
 		if (question === "/config") {
@@ -199,16 +265,16 @@ function CouncilScreen({
 				borderColor="gray"
 				marginY={1}
 			>
-				<Roster members={council.members} statuses={statuses} />
+				{council && <Roster members={council.members} statuses={statuses} />}
 				<Box flexDirection="column" flexGrow={1} paddingX={1}>
 					<Text bold color="blue">
 						MESSAGE THE COUNCIL
 					</Text>
-					{newSessionConfiguration ? (
+					{picker?.kind === "new" ? (
 						<Box flexDirection="column">
 							<Text>Choose a Council for this new Session.</Text>
 							<Select
-								options={newSessionConfiguration.configuration.councils.map(
+								options={picker.configuration.configuration.councils.map(
 									(council) => ({
 										label: council.name,
 										value: council.name,
@@ -216,14 +282,56 @@ function CouncilScreen({
 								)}
 								onChange={(name) => {
 									const selectedCouncil =
-										newSessionConfiguration.configuration.councils.find(
+										picker.configuration.configuration.councils.find(
 											(council) => council.name === name,
 										);
 									if (selectedCouncil)
 										void startSession(
 											selectedCouncil,
-											newSessionConfiguration.profileContents,
+											picker.configuration.profileContents,
 										);
+								}}
+							/>
+						</Box>
+					) : picker?.kind === "resume" ? (
+						<Box flexDirection="column">
+							<Text>Choose a saved Session to resume.</Text>
+							<Select
+								options={recentSessions.map((session) => ({
+									label: sessionLabel(session),
+									value: session.id,
+								}))}
+								onChange={(id) => void resumeSession(id)}
+							/>
+						</Box>
+					) : picker?.kind === "remove" ? (
+						<Box flexDirection="column">
+							<Text>Choose a saved Session to remove.</Text>
+							<Select
+								options={recentSessions.map((session) => ({
+									label: sessionLabel(session),
+									value: session.id,
+								}))}
+								onChange={(id) => {
+									setSessionToRemove(
+										recentSessions.find((session) => session.id === id),
+									);
+									setPicker(undefined);
+								}}
+							/>
+						</Box>
+					) : sessionToRemove ? (
+						<Box flexDirection="column">
+							<Text>Remove this saved Session?</Text>
+							<Text dimColor>{sessionLabel(sessionToRemove)}</Text>
+							<Select
+								options={[
+									{ label: "Cancel", value: "cancel" },
+									{ label: "Remove Session", value: "remove" },
+								]}
+								onChange={(choice) => {
+									if (choice === "remove") void confirmRemove();
+									else setSessionToRemove(undefined);
 								}}
 							/>
 						</Box>
@@ -336,21 +444,39 @@ export function App({
 		setConfiguration(resolved.configuration);
 		return resolved;
 	};
+	const reloadSessions = async () => {
+		const sessions = await loadSessionMetadata(directory);
+		setRecentSessions(sessions);
+		return sessions;
+	};
 
 	useEffect(() => {
-		Promise.all([
+		Promise.allSettled([
 			loadConfiguration(directory, providers),
 			loadSessionMetadata(directory),
 		])
-			.then(([configuration, sessions]) => {
-				setConfiguration(configuration);
-				setRecentSessions(sessions);
-			})
-			.catch((error: unknown) => {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			.then(([configurationResult, sessionsResult]) => {
+				if (sessionsResult.status === "rejected") {
 					setError(
-						error instanceof Error
-							? error.message
+						sessionsResult.reason instanceof Error
+							? sessionsResult.reason.message
+							: "Could not load saved Sessions",
+					);
+					return;
+				}
+				setRecentSessions(sessionsResult.value);
+				if (configurationResult.status === "fulfilled") {
+					setConfiguration(configurationResult.value);
+					return;
+				}
+				if (
+					sessionsResult.value.length === 0 &&
+					(configurationResult.reason as NodeJS.ErrnoException).code !==
+						"ENOENT"
+				) {
+					setError(
+						configurationResult.reason instanceof Error
+							? configurationResult.reason.message
 							: "Could not load configuration",
 					);
 				}
@@ -360,7 +486,7 @@ export function App({
 
 	if (loading) return <Text>Loading OpenAgentCouncil…</Text>;
 	if (error) return <StatusMessage variant="error">{error}</StatusMessage>;
-	if (configuration) {
+	if (configuration || recentSessions.length > 0) {
 		return (
 			<CouncilScreen
 				workingDirectory={workingDirectory}
@@ -368,6 +494,7 @@ export function App({
 				configurationDirectory={directory}
 				recentSessions={recentSessions}
 				onReloadConfiguration={reloadConfiguration}
+				onReloadSessions={reloadSessions}
 				onOpenConfiguration={openConfigurationOverride ?? openConfiguration}
 			/>
 		);
