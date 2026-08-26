@@ -1,6 +1,8 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -50,5 +52,47 @@ test("shutdown signals unmount the app and set conventional exit codes", () => {
 		assert.equal(target.exitCode, exitCode);
 		removeListeners();
 		assert.equal(target.listenerCount(signal), 0);
+	}
+});
+
+test("the built entrypoint restores its terminal on SIGTERM", async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), "council-cli-"));
+	try {
+		const child = spawn(
+			process.execPath,
+			[
+				"--import",
+				path.join(root, "test", "tty-shim.mjs"),
+				path.join(root, "dist", "index.js"),
+			],
+			{
+				cwd: root,
+				env: { ...process.env, HOME: directory, PATH: "" },
+				stdio: ["pipe", "pipe", "pipe"],
+			},
+		);
+		let output = "";
+		child.stdout.on("data", (chunk) => {
+			output += String(chunk);
+		});
+		await new Promise<void>((resolve, reject) => {
+			const timeout = setTimeout(
+				() => reject(new Error("built entrypoint did not render")),
+				2_000,
+			);
+			child.stdout.on("data", () => {
+				if (!output.includes("Install Codex or Claude Code")) return;
+				clearTimeout(timeout);
+				resolve();
+			});
+		});
+		child.kill("SIGTERM");
+		const code = await new Promise<number | null>((resolve) =>
+			child.once("close", resolve),
+		);
+		assert.equal(code, 143);
+		assert.ok(output.includes(`${String.fromCharCode(27)}[?25h`));
+	} finally {
+		await rm(directory, { recursive: true, force: true });
 	}
 });

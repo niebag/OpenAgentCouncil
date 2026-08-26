@@ -93,7 +93,11 @@ export type TimelineEntry =
 			content: string;
 			createdAt: string;
 	  };
-type IncompleteReason = "missing-quorum" | "missing-review" | "chair-failure";
+type IncompleteReason =
+	| "missing-quorum"
+	| "missing-review"
+	| "chair-failure"
+	| "cancelled";
 
 export type DeliberationOutcome =
 	| { kind: "recommendation" }
@@ -246,6 +250,7 @@ export type CouncilControlRequest = {
 	round: number;
 	priorContent: string[];
 	providerSessionReference?: string;
+	signal?: AbortSignal;
 	malformedControl?: string;
 	validationError?: string;
 };
@@ -633,6 +638,26 @@ export function createSession({
 	};
 }
 
+export function appendUserInput(
+	session: Session,
+	content: string,
+	now = () => new Date().toISOString(),
+) {
+	const deliberation = session.deliberations.at(-1);
+	if (!deliberation || deliberation.outcome)
+		throw new Error("No active Deliberation is available");
+	const input = content.trim();
+	if (!input) throw new Error("Additional user input must be non-empty");
+	const entry: Extract<TimelineEntry, { kind: "question" }> = {
+		kind: "question",
+		deliberationId: deliberation.id,
+		content: input,
+		createdAt: now(),
+	};
+	session.timeline.push(entry);
+	return entry;
+}
+
 export async function runDeliberation(
 	session: Session,
 	question: string,
@@ -659,12 +684,13 @@ export async function runDeliberation(
 		providerSessionReferences: {},
 	};
 	session.deliberations.push(deliberation);
-	session.timeline.push({
+	const initialQuestion: Extract<TimelineEntry, { kind: "question" }> = {
 		kind: "question",
 		deliberationId: deliberation.id,
 		content: question,
 		createdAt: deliberation.startedAt,
-	});
+	};
+	session.timeline.push(initialQuestion);
 
 	const events: RuntimeEvent[] = [];
 	const emit = (event: RuntimeEvent) => {
@@ -676,13 +702,27 @@ export async function runDeliberation(
 	);
 	if (!chair) throw new Error("Council requires a Chair and Quorum");
 	let providerCalls = 0;
-	const call = async <T>(operation: () => T | Promise<T>): Promise<T> => {
+	const call = async <T>(
+		operation: () => T | Promise<T>,
+		cancelPromise = false,
+	): Promise<T> => {
 		signal?.throwIfAborted();
 		if (providerCalls >= deliberationBudget.providerCalls) {
 			throw new Error("Deliberation provider-call budget exhausted");
 		}
 		providerCalls += 1;
-		return operation();
+		const result = Promise.resolve().then(operation);
+		if (!signal || !cancelPromise) return result;
+		let abort: () => void = () => {};
+		const cancelled = new Promise<never>((_, reject) => {
+			abort = () => reject(signal.reason ?? new Error("Deliberation aborted"));
+			signal.addEventListener("abort", abort, { once: true });
+		});
+		try {
+			return await Promise.race([result, cancelled]);
+		} finally {
+			signal.removeEventListener("abort", abort);
+		}
 	};
 	const contributions = () =>
 		session.timeline.filter(
@@ -696,18 +736,26 @@ export async function runDeliberation(
 		);
 	const visibleContent = () =>
 		session.timeline.flatMap((entry) =>
-			entry.deliberationId === deliberation.id && entry.kind !== "question"
+			entry.deliberationId === deliberation.id && entry !== initialQuestion
 				? [
-						`${"member" in entry ? `@${entry.member}` : "Council"} (${entry.kind}):\n${entry.content}`,
+						entry.kind === "question"
+							? `User (additional input):\n${entry.content}`
+							: `${"member" in entry ? `@${entry.member}` : "Council"} (${entry.kind}):\n${entry.content}`,
 					]
 				: [],
 		);
+	const userInputRevision = () =>
+		session.timeline.filter(
+			(entry) =>
+				entry.deliberationId === deliberation.id && entry.kind === "question",
+		).length;
 	const collectContribution = async (
 		kind: CouncilPhase,
 		member: SessionMember,
 		priorContent: string[],
 		validate?: (content: string) => void,
 	) => {
+		const inputRevision = userInputRevision();
 		emit({ kind: "member-status", member: member.handle, status: "working" });
 		let typing = false;
 		const onPartial = () => {
@@ -736,15 +784,17 @@ export async function runDeliberation(
 				source?: CouncilSource;
 			} = typeof response === "string" ? { content: response } : response;
 			const { content } = result;
+			if (result.providerSessionReference) {
+				deliberation.providerSessionReferences[member.handle] =
+					result.providerSessionReference;
+			}
+			if (member.role === "Chair" && inputRevision !== userInputRevision())
+				return collectContribution(kind, member, visibleContent(), validate);
 			if (content.trim().length === 0) {
 				throw new Error(`${kind} content must be non-empty`);
 			}
 			onPartial();
 			validate?.(content);
-			if (result.providerSessionReference) {
-				deliberation.providerSessionReferences[member.handle] =
-					result.providerSessionReference;
-			}
 			const entry = {
 				kind,
 				deliberationId: deliberation.id,
@@ -812,6 +862,7 @@ export async function runDeliberation(
 		emit({ kind: "content", entry });
 		return events;
 	};
+	const cancel = () => incomplete("cancelled", "cancelled by the user");
 	const getControl = async <Result>(
 		phase: CouncilControlRequest["phase"],
 		round: number,
@@ -830,6 +881,7 @@ export async function runDeliberation(
 					priorContent: visibleContent(),
 					providerSessionReference:
 						deliberation.providerSessionReferences[chair.handle],
+					signal,
 					malformedControl,
 					validationError,
 				}),
@@ -856,7 +908,13 @@ export async function runDeliberation(
 		question,
 		requestedMembers: requestedMemberHandles(question, session.council.members),
 	};
-	let control = await call(() => adapter.selectParticipants(selection));
+	let control: string;
+	try {
+		control = await call(() => adapter.selectParticipants(selection), true);
+	} catch (error) {
+		if (signal?.aborted) return cancel();
+		throw error;
+	}
 	let handles: string[];
 	try {
 		handles = participantHandles(
@@ -865,17 +923,24 @@ export async function runDeliberation(
 			selection.requestedMembers,
 		);
 	} catch {
-		control = await call(() =>
-			adapter.selectParticipants({
-				...selection,
-				malformedControl: control,
-			}),
-		);
-		handles = participantHandles(
-			control,
-			session.council.members,
-			selection.requestedMembers,
-		);
+		try {
+			control = await call(
+				() =>
+					adapter.selectParticipants({
+						...selection,
+						malformedControl: control,
+					}),
+				true,
+			);
+			handles = participantHandles(
+				control,
+				session.council.members,
+				selection.requestedMembers,
+			);
+		} catch (repairError) {
+			if (signal?.aborted) return cancel();
+			throw repairError;
+		}
 	}
 	const participants = handles.map((handle) =>
 		session.council.members.find((member) => member.handle === handle),
@@ -887,7 +952,7 @@ export async function runDeliberation(
 	const positions = positionResults.flatMap((result) =>
 		result.status === "fulfilled" ? [result.value] : [],
 	);
-	signal?.throwIfAborted();
+	if (signal?.aborted) return cancel();
 	if (new Set(positions.map((position) => position.member)).size < 2) {
 		return incomplete(
 			"missing-quorum",
@@ -1052,6 +1117,7 @@ export async function runDeliberation(
 			);
 		}
 	} catch (error) {
+		if (signal?.aborted) return cancel();
 		emit({ kind: "member-status", member: chair.handle, status: "failed" });
 		return incomplete(
 			"chair-failure",
@@ -1067,6 +1133,7 @@ export async function runDeliberation(
 			visibleContent(),
 		);
 	} catch (error) {
+		if (signal?.aborted) return cancel();
 		return incomplete(
 			"chair-failure",
 			error instanceof Error ? error.message : "Chair draft failed",
@@ -1080,6 +1147,7 @@ export async function runDeliberation(
 	const reviews = reviewResults.flatMap((result) =>
 		result.status === "fulfilled" ? [result.value] : [],
 	);
+	if (signal?.aborted) return cancel();
 	if (reviews.length === 0) {
 		return incomplete(
 			"missing-review",
@@ -1096,6 +1164,7 @@ export async function runDeliberation(
 				validateRecommendation(content, participants, contributions()),
 		);
 	} catch (error) {
+		if (signal?.aborted) return cancel();
 		return incomplete(
 			"chair-failure",
 			error instanceof Error ? error.message : "Chair finalization failed",

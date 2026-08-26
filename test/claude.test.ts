@@ -68,7 +68,7 @@ if (mode === "malformed") {
   process.stdout.write("not json\\n");
   setInterval(() => {}, 1_000);
 } else if (mode === "exit") {
-  process.stderr.write("fixture failed");
+	process.stderr.write("OPEN_AGENT_COUNCIL_SECRET");
   process.exit(7);
 } else if (mode === "hang" || mode === "ignore-term") {
   setInterval(() => {}, 1_000);
@@ -393,8 +393,8 @@ test("resumes the native Claude session with read-only non-web tools", async () 
 
 for (const [mode, pattern] of [
 	["malformed", /malformed structured output/],
-	["exit", /exited with code 7: fixture failed/],
-	["failure", /Claude Code failed: fixture rejected/],
+	["exit", /exited with code 7$/],
+	["failure", /Claude Code reported a failed result/],
 	["bad-tools", /requested tool boundaries/],
 	["bad-skills", /skills/],
 ] as const) {
@@ -416,7 +416,9 @@ for (const [mode, pattern] of [
 						onPartial() {},
 					}),
 				),
-				pattern,
+				(error: Error) =>
+					pattern.test(error.message) &&
+					!/OPEN_AGENT_COUNCIL_SECRET|fixture rejected/.test(error.message),
 			);
 		} finally {
 			await server.remove();

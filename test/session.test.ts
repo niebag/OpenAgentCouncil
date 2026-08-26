@@ -20,6 +20,7 @@ import {
 	validateConfiguration,
 } from "../src/configuration.js";
 import {
+	appendUserInput,
 	createSession,
 	deterministicFakeAdapter,
 	loadSession,
@@ -600,7 +601,7 @@ test("owns the Chair provider session reference in Deliberation state", async ()
 	);
 });
 
-test("cancels a Deliberation without adding partial content", async () => {
+test("cancels a Deliberation as incomplete while preserving completed content", async () => {
 	const session = createSession({
 		council,
 		workingDirectory: "/tmp/workspace",
@@ -622,14 +623,153 @@ test("cancels a Deliberation without adding partial content", async () => {
 	});
 
 	await new Promise((resolve) => setImmediate(resolve));
-	controller.abort();
 	responses.get("researcher")?.("Researcher Position");
+	await new Promise((resolve) => setImmediate(resolve));
+	controller.abort();
 	responses.get("critic")?.("Critic Position");
-	await assert.rejects(deliberation, /abort/i);
+	await deliberation;
+	assert.deepEqual(session.deliberations[0]?.outcome, {
+		kind: "incomplete-deliberation",
+		reason: "cancelled",
+	});
 	assert.deepEqual(
 		session.timeline.map((entry) => entry.kind),
-		["question"],
+		["question", "position", "incomplete-deliberation"],
 	);
+});
+
+test("routes additional user input through the Chair in the active Deliberation", async () => {
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	const responses = new Map<string, (content: string) => void>();
+	let chairContent: string[] = [];
+	const deliberation = runDeliberation(session, "Should we ship it?", {
+		adapter: {
+			selectParticipants: deterministicFakeAdapter.selectParticipants,
+			control(request) {
+				chairContent = request.priorContent;
+				return deterministicFakeAdapter.control(request);
+			},
+			respond(request) {
+				if (request.phase !== "position")
+					return deterministicFakeAdapter.respond(request);
+				return new Promise((resolve: (content: string) => void) =>
+					responses.set(request.member.handle, resolve),
+				);
+			},
+		},
+	});
+
+	await new Promise((resolve) => setImmediate(resolve));
+	appendUserInput(session, "Prioritize a reversible rollout.");
+	responses.get("researcher")?.("Researcher Position");
+	responses.get("critic")?.("Critic Position");
+	await deliberation;
+
+	assert.equal(session.deliberations.length, 1);
+	assert.ok(
+		session.timeline.some(
+			(entry) =>
+				entry.kind === "question" &&
+				entry.content === "Prioritize a reversible rollout.",
+		),
+	);
+	assert.ok(
+		chairContent.some((content) =>
+			content.includes("Prioritize a reversible rollout."),
+		),
+	);
+});
+
+test("reroutes input appended during a Chair contribution before completing", async () => {
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	let startedRecommendation: () => void = () => {};
+	const recommendationStarted = new Promise<void>((resolve) => {
+		startedRecommendation = resolve;
+	});
+	let releaseRecommendation: () => void = () => {};
+	const chair = session.council.members.find(
+		(member) => member.role === "Chair",
+	);
+	if (!chair) throw new Error("Chair fixture is required");
+	const recommendationContent = deterministicFakeAdapter.respond({
+		phase: "recommendation",
+		member: chair,
+		question: "Should we ship?",
+		priorContent: [],
+		workingDirectory: session.workingDirectory,
+		onPartial() {},
+	});
+	const chairInputs: string[][] = [];
+	const deliberation = runDeliberation(session, "Should we ship?", {
+		adapter: {
+			...deterministicFakeAdapter,
+			respond(request) {
+				if (request.phase !== "recommendation")
+					return deterministicFakeAdapter.respond(request);
+				chairInputs.push(request.priorContent);
+				if (chairInputs.length > 1) return recommendationContent;
+				startedRecommendation();
+				return new Promise((resolve) => {
+					releaseRecommendation = () => resolve(recommendationContent);
+				});
+			},
+		},
+	});
+
+	await recommendationStarted;
+	appendUserInput(session, "Include the late rollback constraint.");
+	releaseRecommendation();
+	await deliberation;
+
+	assert.equal(chairInputs.length, 2);
+	assert.ok(
+		chairInputs[1]?.some((content) =>
+			content.includes("Include the late rollback constraint."),
+		),
+	);
+	assert.deepEqual(session.deliberations[0]?.outcome, {
+		kind: "recommendation",
+	});
+});
+
+test("cancels while the Chair is selecting participants", async () => {
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	const controller = new AbortController();
+	let selectionStarted: () => void = () => {};
+	const started = new Promise<void>((resolve) => {
+		selectionStarted = resolve;
+	});
+	const deliberation = runDeliberation(session, "Should we ship?", {
+		signal: controller.signal,
+		adapter: {
+			...deterministicFakeAdapter,
+			selectParticipants() {
+				selectionStarted();
+				return new Promise(() => {});
+			},
+		},
+	});
+
+	await started;
+	controller.abort();
+	await deliberation;
+
+	assert.deepEqual(session.deliberations[0]?.outcome, {
+		kind: "incomplete-deliberation",
+		reason: "cancelled",
+	});
 });
 
 test("repairs Chair selection once and honors direct Member Handle mentions", async () => {

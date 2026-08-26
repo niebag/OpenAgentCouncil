@@ -1,7 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import { detachedProcess, terminateProcess } from "./child-process.js";
 import {
 	deterministicFakeAdapter,
 	CouncilAdapterError,
@@ -43,25 +44,6 @@ const settings = JSON.stringify({
 	enabledPlugins: {},
 });
 const mcpConfiguration = JSON.stringify({ mcpServers: {} });
-
-function wait(milliseconds: number) {
-	return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function terminate(
-	child: ChildProcessWithoutNullStreams,
-	exited: Promise<void>,
-	grace: number,
-) {
-	if (child.exitCode !== null || child.signalCode !== null) return;
-	child.kill("SIGTERM");
-	if (
-		await Promise.race([exited.then(() => true), wait(grace).then(() => false)])
-	)
-		return;
-	child.kill("SIGKILL");
-	await exited;
-}
 
 function expectedTools(request: CouncilRequest) {
 	if (request.phase === "assignment")
@@ -162,11 +144,11 @@ async function runClaude(
 	environment.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
 	const child = spawn(options.command, arguments_, {
 		cwd: request.workingDirectory,
+		detached: detachedProcess,
 		env: environment,
 		stdio: "pipe",
 	});
 	child.stdin.end();
-	let stderr = "";
 	let sessionId: string | undefined;
 	let result: ClaudeMessage | undefined;
 	let init: ClaudeMessage | undefined;
@@ -188,9 +170,7 @@ async function runClaude(
 	}>((resolve) => {
 		processResolve = resolve;
 	});
-	child.stderr.on("data", (chunk) => {
-		stderr = `${stderr}${String(chunk)}`.slice(-4_000);
-	});
+	child.stderr.resume();
 	child.once("error", (error) => {
 		exitResolve();
 		fatalReject(new Error(`Could not start Claude Code: ${error.message}`));
@@ -248,9 +228,8 @@ async function runClaude(
 			timedOut,
 		]);
 		if (outcome.code !== 0) {
-			const detail = stderr.trim();
 			throw new Error(
-				`Claude Code exited with ${outcome.code === null ? `signal ${outcome.signal}` : `code ${outcome.code}`}${detail ? `: ${detail}` : ""}`,
+				`Claude Code exited with ${outcome.code === null ? `signal ${outcome.signal}` : `code ${outcome.code}`}`,
 			);
 		}
 		if (!init)
@@ -263,9 +242,7 @@ async function runClaude(
 			result.is_error ||
 			typeof result.result !== "string"
 		) {
-			throw new Error(
-				`Claude Code failed: ${typeof result.result === "string" ? result.result : (result.subtype ?? "unknown error")}`,
-			);
+			throw new Error("Claude Code reported a failed result");
 		}
 		if (!sessionId) throw new Error("Claude Code did not return a session ID");
 		return {
@@ -274,7 +251,7 @@ async function runClaude(
 			source: { provider: "claude", transport: "print-mode" },
 		};
 	} catch (error) {
-		await terminate(child, exited, options.terminationGraceMs);
+		await terminateProcess(child, exited, options.terminationGraceMs);
 		const message =
 			error instanceof Error ? error.message : "Claude Code call failed";
 		throw new CouncilAdapterError(
@@ -289,7 +266,6 @@ async function runClaude(
 				transport: "print-mode",
 				nativeReference: sessionId,
 			},
-			{ cause: error },
 		);
 	} finally {
 		if (timeout) clearTimeout(timeout);
@@ -304,12 +280,8 @@ export function createClaudeCouncilAdapter({
 	timeoutMs = 120_000,
 	terminationGraceMs = 500,
 }: Options): CouncilAdapter {
-	let claudeMember: string | undefined;
 	return {
-		selectParticipants(input) {
-			claudeMember = undefined;
-			return fallback.selectParticipants(input);
-		},
+		selectParticipants: fallback.selectParticipants,
 		async control(request) {
 			if (request.chair.provider !== "claude") return fallback.control(request);
 			return runClaude(
@@ -320,6 +292,7 @@ export function createClaudeCouncilAdapter({
 					priorContent: request.priorContent,
 					workingDirectory,
 					providerSessionReference: request.providerSessionReference,
+					signal: request.signal,
 					onPartial() {},
 					control: request,
 				},
@@ -327,16 +300,7 @@ export function createClaudeCouncilAdapter({
 			);
 		},
 		respond(request) {
-			const assignment =
-				request.phase === "assignment" && request.member.provider === "claude";
-			if (
-				!assignment &&
-				!claudeMember &&
-				request.member.provider === "claude" &&
-				request.member.role !== "Chair"
-			)
-				claudeMember ??= request.member.handle;
-			if (!assignment && request.member.handle !== claudeMember)
+			if (request.member.provider !== "claude")
 				return fallback.respond(request);
 			if (
 				path.resolve(request.workingDirectory) !==

@@ -454,7 +454,74 @@ test("uses responsive scrollback messages and composer completions", async () =>
 	await rm(configurationDirectory, { recursive: true, force: true });
 });
 
-test("stops an active Deliberation before another one can be saved", async () => {
+test("renders mixed-provider statuses and only atomic completed messages", async () => {
+	const configurationDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-"),
+	);
+	await createEngineeringCouncil(configurationDirectory, "codex");
+	const configuration = await loadConfiguration(configurationDirectory, [
+		"codex",
+	]);
+	const researcher = configuration.councils[0]?.members.find(
+		(member) => member.handle === "researcher",
+	);
+	if (!researcher) throw new Error("Researcher fixture is required");
+	researcher.provider = "claude";
+	researcher.capabilities = ["web"];
+	await writeFile(
+		path.join(configurationDirectory, "council.json"),
+		JSON.stringify(configuration),
+	);
+	const instance = render(
+		createElement(App, {
+			workingDirectory: "/tmp/council-workspace",
+			configurationDirectory,
+			availableProviders: ["codex", "claude"],
+			adapter: {
+				selectParticipants: () =>
+					JSON.stringify({
+						kind: "select-participants",
+						members: ["researcher", "critic", "prototyper"],
+					}),
+				control: deterministicFakeAdapter.control,
+				async respond(request) {
+					if (request.phase === "position") {
+						await new Promise((resolve) => setTimeout(resolve, 25));
+						request.onPartial();
+						await new Promise((resolve) => setTimeout(resolve, 25));
+						if (request.member.handle === "critic")
+							throw new Error("fixture unavailable");
+					}
+					return deterministicFakeAdapter.respond(request);
+				},
+			},
+		}),
+	);
+	await settle();
+	instance.stdin.write("/new");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("Should mixed providers proceed?");
+	await settle();
+	instance.stdin.write("\r");
+	await settle(500);
+
+	const frames = instance.frames.join("\n");
+	assert.match(frames, /researching/i);
+	assert.match(frames, /thinking/i);
+	assert.match(frames, /typing/i);
+	assert.match(frames, /failed/i);
+	assert.match(frames, /Researcher Position/);
+	assert.match(frames, /Prototyper Position/);
+
+	instance.unmount();
+	await rm(configurationDirectory, { recursive: true, force: true });
+});
+
+test("stops and persists an active Deliberation before starting another", async () => {
 	const configurationDirectory = await mkdtemp(
 		path.join(os.tmpdir(), "openagentcouncil-"),
 	);
@@ -483,6 +550,8 @@ test("stops an active Deliberation before another one can be saved", async () =>
 	await settle();
 	instance.stdin.write("\r");
 	await settle();
+	instance.stdin.write("\r");
+	await settle();
 	instance.stdin.write("Stop this Deliberation.");
 	await settle();
 	instance.stdin.write("\r");
@@ -507,12 +576,149 @@ test("stops an active Deliberation before another one can be saved", async () =>
 			),
 		);
 	})();
-	assert.equal(saved?.deliberations.length, 1);
-	assert.equal(saved?.deliberations[0]?.question, "Keep discussing.");
+	assert.equal(saved?.deliberations.length, 2);
+	assert.deepEqual(saved?.deliberations[0]?.outcome, {
+		kind: "incomplete-deliberation",
+		reason: "cancelled",
+	});
+	assert.equal(saved?.deliberations[1]?.question, "Keep discussing.");
 
 	instance.unmount();
 	await rm(configurationDirectory, { recursive: true, force: true });
 });
+
+test("persists additional input in the active Deliberation and routes it through the Chair", async () => {
+	const configurationDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-"),
+	);
+	await createEngineeringCouncil(configurationDirectory, "codex");
+	const pending = new Map<string, (content: string) => void>();
+	let chairContent: string[] = [];
+	const instance = render(
+		createElement(App, {
+			workingDirectory: "/tmp/council-workspace",
+			configurationDirectory,
+			availableProviders: ["codex"],
+			adapter: {
+				selectParticipants: deterministicFakeAdapter.selectParticipants,
+				control(request) {
+					chairContent = request.priorContent;
+					return deterministicFakeAdapter.control(request);
+				},
+				respond(request) {
+					if (request.phase !== "position")
+						return deterministicFakeAdapter.respond(request);
+					return new Promise((resolve: (content: string) => void) =>
+						pending.set(request.member.handle, resolve),
+					);
+				},
+			},
+		}),
+	);
+	await settle();
+	instance.stdin.write("/new");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("Should we ship?");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("Prioritize a reversible rollout.");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	pending.get("researcher")?.("Researcher Position");
+	pending.get("critic")?.("Critic Position");
+	await settle(250);
+
+	const [metadata] = await loadSessionMetadata(configurationDirectory);
+	assert.ok(metadata);
+	const saved = await loadSession(configurationDirectory, metadata.id);
+	assert.equal(saved.deliberations.length, 1);
+	assert.equal(saved.deliberations[0]?.question, "Should we ship?");
+	assert.ok(
+		saved.timeline.some(
+			(entry) =>
+				entry.kind === "question" &&
+				entry.content === "Prioritize a reversible rollout.",
+		),
+	);
+	assert.ok(
+		chairContent.some((content) =>
+			content.includes("Prioritize a reversible rollout."),
+		),
+	);
+
+	instance.unmount();
+	await rm(configurationDirectory, { recursive: true, force: true });
+});
+
+for (const shutdown of ["Ctrl+C", "unmount"] as const) {
+	test(`${shutdown} settles and persists active work`, async () => {
+		const configurationDirectory = await mkdtemp(
+			path.join(os.tmpdir(), "openagentcouncil-"),
+		);
+		await createEngineeringCouncil(configurationDirectory, "codex");
+		const instance = render(
+			createElement(App, {
+				workingDirectory: "/tmp/council-workspace",
+				configurationDirectory,
+				availableProviders: ["codex"],
+				adapter: {
+					selectParticipants: deterministicFakeAdapter.selectParticipants,
+					control: deterministicFakeAdapter.control,
+					respond(request) {
+						if (
+							request.phase === "position" &&
+							request.member.handle === "critic"
+						)
+							return new Promise((_, reject) =>
+								request.signal?.addEventListener(
+									"abort",
+									() => reject(request.signal?.reason),
+									{ once: true },
+								),
+							);
+						return deterministicFakeAdapter.respond(request);
+					},
+				},
+			}),
+		);
+		await settle();
+		instance.stdin.write("/new");
+		await settle();
+		instance.stdin.write("\r");
+		await settle();
+		instance.stdin.write("\r");
+		await settle();
+		instance.stdin.write("Should shutdown safely.");
+		await settle();
+		instance.stdin.write("\r");
+		await settle();
+		if (shutdown === "Ctrl+C") instance.stdin.write("\x03");
+		else instance.unmount();
+		await settle(250);
+
+		const [metadata] = await loadSessionMetadata(configurationDirectory);
+		assert.ok(metadata);
+		const saved = await loadSession(configurationDirectory, metadata.id);
+		assert.deepEqual(saved.deliberations[0]?.outcome, {
+			kind: "incomplete-deliberation",
+			reason: "cancelled",
+		});
+		assert.ok(
+			saved.timeline.some(
+				(entry) => entry.kind === "position" && entry.member === "researcher",
+			),
+		);
+
+		instance.unmount();
+		await rm(configurationDirectory, { recursive: true, force: true });
+	});
+}
 
 for (const [name, providers, expected, unexpected] of [
 	["Claude-only", ["claude"], /Claude Code/, /Codex/],

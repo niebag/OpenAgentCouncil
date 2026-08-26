@@ -22,6 +22,7 @@ import {
 import { createClaudeCouncilAdapter } from "./claude.js";
 import { createCodexCouncilAdapter } from "./codex.js";
 import {
+	appendUserInput,
 	createSession,
 	loadSession,
 	loadSessionMetadata,
@@ -440,20 +441,29 @@ function CouncilScreen({
 			setError(`Unknown command: ${value.split(/\s/, 1)[0]}. Type /help.`);
 			return;
 		}
-		if (busy) {
-			setNotice("Waiting for the active Deliberation to stop.");
-			return;
-		}
 		if (!session) {
 			setDraft(value);
 			setCursor([0, value.length]);
 			setError("Start a new Session with /new.");
 			return;
 		}
+		if (busy) {
+			try {
+				appendUserInput(session, value);
+				setSession({ ...session });
+				await saveSession(configurationDirectory, session);
+				setNotice("Added input to the active Deliberation.");
+			} catch (cause) {
+				setError(
+					cause instanceof Error
+						? cause.message
+						: "Could not add input to the Deliberation",
+				);
+			}
+			return;
+		}
 		const currentRun = runId.current + 1;
 		runId.current = currentRun;
-		const timelineLength = session.timeline.length;
-		const deliberationLength = session.deliberations.length;
 		const controller = new AbortController();
 		abortController.current = controller;
 		setBusy(true);
@@ -497,8 +507,7 @@ function CouncilScreen({
 			setError(undefined);
 		} catch (cause) {
 			if (currentRun === runId.current && controller.signal.aborted) {
-				session.timeline.splice(timelineLength);
-				session.deliberations.splice(deliberationLength);
+				await saveSession(configurationDirectory, session);
 				setSession({ ...session });
 			} else if (currentRun === runId.current)
 				setError(

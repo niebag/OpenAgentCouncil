@@ -57,7 +57,10 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 		} });
 		send({ id: message.id, result: { turn: { id: "turn-1" } } });
 		if (mode === "malformed") return process.stdout.write("not json\\n");
-		if (mode === "exit") return process.exit(7);
+		if (mode === "exit") {
+			process.stderr.write("OPEN_AGENT_COUNCIL_SECRET");
+			return process.exit(7);
+		}
 		if (mode === "hang" || mode === "ignore-term") return;
 		const content = message.params.input[0].text.includes("Direct the next Council step") ? (mode === "assignment-control" ? '{"kind":"propose-assignment","member":"researcher","goal":"Create proof","expectedFiles":["proof.txt"]}' : '{"kind":"draft-recommendation"}') : "Fixture Position";
 		send({ method: "item/agentMessage/delta", params: { threadId: "codex-thread-1", turnId: "turn-1", itemId: "item-1", delta: "Fixture" } });
@@ -461,7 +464,9 @@ for (const [mode, pattern] of [
 						onPartial() {},
 					}),
 				),
-				pattern,
+				(error: Error) =>
+					pattern.test(error.message) &&
+					!error.message.includes("OPEN_AGENT_COUNCIL_SECRET"),
 			);
 		} finally {
 			await server.remove();

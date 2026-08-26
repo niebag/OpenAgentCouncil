@@ -1,7 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { access, realpath } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import { detachedProcess, terminateProcess } from "./child-process.js";
 import {
 	deterministicFakeAdapter,
 	CouncilAdapterError,
@@ -54,30 +55,6 @@ const appServerArguments = [
 	"-c",
 	"mcp_servers={}",
 ] as const;
-
-function wait(milliseconds: number) {
-	return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function terminate(
-	child: ChildProcessWithoutNullStreams,
-	exited: Promise<void>,
-	grace: number,
-) {
-	if (child.exitCode !== null || child.signalCode !== null) return;
-	child.stdin.end();
-	if (
-		await Promise.race([exited.then(() => true), wait(grace).then(() => false)])
-	)
-		return;
-	child.kill("SIGTERM");
-	if (
-		await Promise.race([exited.then(() => true), wait(grace).then(() => false)])
-	)
-		return;
-	child.kill("SIGKILL");
-	await exited;
-}
 
 async function assertBoundaries(
 	result: Record<string, unknown>,
@@ -156,13 +133,13 @@ async function runCodex(
 	request.signal?.throwIfAborted();
 	const child = spawn(options.command, [...appServerArguments], {
 		cwd: request.workingDirectory,
+		detached: detachedProcess,
 		stdio: "pipe",
 	});
 	let exitResolve: () => void = () => {};
 	const exited = new Promise<void>((resolve) => {
 		exitResolve = resolve;
 	});
-	let stderr = "";
 	let nextId = 1;
 	let threadId: string | undefined;
 	let turnId: string | undefined;
@@ -199,19 +176,16 @@ async function runCodex(
 		return response;
 	};
 
-	child.stderr.on("data", (chunk) => {
-		stderr = `${stderr}${String(chunk)}`.slice(-4_000);
-	});
+	child.stderr.resume();
 	child.once("error", (error) =>
 		fail(new Error(`Could not start Codex App Server: ${error.message}`)),
 	);
 	child.once("exit", (code, signal) => {
 		exitResolve();
 		if (!completed) {
-			const detail = stderr.trim();
 			fail(
 				new Error(
-					`Codex App Server exited with ${code === null ? `signal ${signal}` : `code ${code}`}${detail ? `: ${detail}` : ""}`,
+					`Codex App Server exited with ${code === null ? `signal ${signal}` : `code ${code}`}`,
 				),
 			);
 		}
@@ -229,11 +203,7 @@ async function runCodex(
 			if (!waiter) return;
 			pending.delete(message.id);
 			if (message.error)
-				waiter.reject(
-					new Error(
-						`Codex App Server rejected the request: ${message.error.message ?? "unknown error"}`,
-					),
-				);
+				waiter.reject(new Error("Codex App Server rejected the request"));
 			else waiter.resolve(message.result ?? {});
 			return;
 		}
@@ -256,23 +226,13 @@ async function runCodex(
 			}
 		}
 		if (message.method === "error" && message.params?.willRetry === false) {
-			const error = message.params.error as { message?: string } | undefined;
-			fail(
-				new Error(
-					`Codex App Server failed: ${error?.message ?? "unknown error"}`,
-				),
-			);
+			fail(new Error("Codex App Server reported a failed event"));
 		}
 		if (message.method === "turn/completed") {
 			const turn = message.params?.turn as
 				| { status?: string; error?: { message?: string } }
 				| undefined;
-			if (turn?.status === "failed")
-				fail(
-					new Error(
-						`Codex turn failed: ${turn.error?.message ?? "unknown error"}`,
-					),
-				);
+			if (turn?.status === "failed") fail(new Error("Codex turn failed"));
 			else if (turn?.status === "interrupted")
 				fail(new Error("Codex turn was interrupted"));
 			else if (turn?.status === "completed") {
@@ -409,12 +369,11 @@ async function runCodex(
 				transport: "app-server",
 				nativeReference: threadId,
 			},
-			{ cause: error },
 		);
 	} finally {
 		if (timeout) clearTimeout(timeout);
 		if (abort) request.signal?.removeEventListener("abort", abort);
-		await terminate(child, exited, options.terminationGraceMs);
+		await terminateProcess(child, exited, options.terminationGraceMs, true);
 	}
 }
 
@@ -425,7 +384,6 @@ export function createCodexCouncilAdapter({
 	timeoutMs = 120_000,
 	terminationGraceMs = 500,
 }: Options): CouncilAdapter {
-	let codexMember: string | undefined;
 	return {
 		selectParticipants: fallback.selectParticipants,
 		async control(request) {
@@ -438,6 +396,7 @@ export function createCodexCouncilAdapter({
 					priorContent: request.priorContent,
 					workingDirectory,
 					providerSessionReference: request.providerSessionReference,
+					signal: request.signal,
 					onPartial() {},
 					control: request,
 				},
@@ -445,16 +404,7 @@ export function createCodexCouncilAdapter({
 			);
 		},
 		respond(request) {
-			const assignment =
-				request.phase === "assignment" && request.member.provider === "codex";
-			if (
-				!assignment &&
-				request.member.provider === "codex" &&
-				request.member.role !== "Chair"
-			)
-				codexMember ??= request.member.handle;
-			if (!assignment && request.member.handle !== codexMember)
-				return fallback.respond(request);
+			if (request.member.provider !== "codex") return fallback.respond(request);
 			if (
 				path.resolve(request.workingDirectory) !==
 				path.resolve(workingDirectory)
