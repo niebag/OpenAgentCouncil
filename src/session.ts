@@ -84,7 +84,7 @@ export type RuntimeEvent =
 	| {
 			kind: "member-status";
 			member: string;
-			status: "working" | "completed" | "failed";
+			status: "working" | "typing" | "completed" | "failed";
 	  }
 	| { kind: "content"; entry: Exclude<TimelineEntry, { kind: "question" }> };
 
@@ -411,10 +411,12 @@ export async function runDeliberation(
 		adapter = deterministicFakeAdapter,
 		now = () => new Date().toISOString(),
 		onEvent,
+		signal,
 	}: {
 		adapter?: CouncilAdapter;
 		now?: () => string;
 		onEvent?: (event: RuntimeEvent) => void;
+		signal?: AbortSignal;
 	} = {},
 ): Promise<RuntimeEvent[]> {
 	const deliberation: Deliberation = {
@@ -442,6 +444,7 @@ export async function runDeliberation(
 	if (!chair) throw new Error("Council requires a Chair and Quorum");
 	let providerCalls = 0;
 	const call = async <T>(operation: () => T | Promise<T>): Promise<T> => {
+		signal?.throwIfAborted();
 		if (providerCalls >= deliberationBudget.providerCalls) {
 			throw new Error("Deliberation provider-call budget exhausted");
 		}
@@ -469,10 +472,12 @@ export async function runDeliberation(
 		validate?: (content: string) => void,
 	) => {
 		emit({ kind: "member-status", member: member.handle, status: "working" });
+		emit({ kind: "member-status", member: member.handle, status: "typing" });
 		try {
 			const content = await call(() =>
 				adapter.respond({ phase: kind, member, question, priorContent }),
 			);
+			signal?.throwIfAborted();
 			if (content.trim().length === 0) {
 				throw new Error(`${kind} content must be non-empty`);
 			}
@@ -493,6 +498,7 @@ export async function runDeliberation(
 			});
 			return entry;
 		} catch (error) {
+			if (signal?.aborted) throw error;
 			const entry: Extract<TimelineEntry, { kind: "member-failure" }> = {
 				kind: "member-failure",
 				deliberationId: deliberation.id,
@@ -590,6 +596,7 @@ export async function runDeliberation(
 	const positions = positionResults.flatMap((result) =>
 		result.status === "fulfilled" ? [result.value] : [],
 	);
+	signal?.throwIfAborted();
 	if (new Set(positions.map((position) => position.member)).size < 2) {
 		return incomplete(
 			"missing-quorum",

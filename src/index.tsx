@@ -8,5 +8,5 @@ if (!process.stdin.isTTY || !process.stdout.isTTY) {
 	);
 	process.exitCode = 1;
 } else {
-	render(<App workingDirectory={process.cwd()} />);
+	render(<App workingDirectory={process.cwd()} />, { exitOnCtrlC: false });
 }

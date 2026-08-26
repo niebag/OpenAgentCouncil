@@ -234,6 +234,17 @@ test("runs and persists a normalized fake Deliberation", async () => {
 	assert.equal(session.timeline.at(-1)?.kind, "recommendation");
 	assert.ok(events.some((event) => event.kind === "member-status"));
 	assert.ok(events.some((event) => event.kind === "content"));
+	for (const event of events) {
+		if (event.kind !== "content") continue;
+		assert.ok(
+			events.some(
+				(candidate) =>
+					candidate.kind === "member-status" &&
+					candidate.member === event.entry.member &&
+					candidate.status === "typing",
+			),
+		);
+	}
 	assert.doesNotMatch(JSON.stringify(events), /fake-provider/i);
 
 	const file = path.join(directory, "sessions", `${session.id}.json`);
@@ -312,6 +323,38 @@ test("gathers Chair-selected Positions independently as they complete", async ()
 		["critic", "researcher"],
 	);
 	assert.doesNotMatch(JSON.stringify(session.timeline), /select-participants/);
+});
+
+test("cancels a Deliberation without adding partial content", async () => {
+	const session = createSession({
+		council,
+		workingDirectory: "/tmp/workspace",
+		profileContents: {},
+	});
+	const controller = new AbortController();
+	const responses = new Map<string, (content: string) => void>();
+	const deliberation = runDeliberation(session, "Should we ship it?", {
+		signal: controller.signal,
+		adapter: {
+			selectParticipants: deterministicFakeAdapter.selectParticipants,
+			control: deterministicFakeAdapter.control,
+			respond({ member }) {
+				return new Promise((resolve: (content: string) => void) =>
+					responses.set(member.handle, resolve),
+				);
+			},
+		},
+	});
+
+	await new Promise((resolve) => setImmediate(resolve));
+	controller.abort();
+	responses.get("researcher")?.("Researcher Position");
+	responses.get("critic")?.("Critic Position");
+	await assert.rejects(deliberation, /abort/i);
+	assert.deepEqual(
+		session.timeline.map((entry) => entry.kind),
+		["question"],
+	);
 });
 
 test("repairs Chair selection once and honors direct Member Handle mentions", async () => {

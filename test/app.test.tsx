@@ -12,12 +12,15 @@ import {
 } from "../src/configuration.js";
 import {
 	createSession,
+	deterministicFakeAdapter,
 	loadSession,
+	loadSessionMetadata,
 	runDeliberation,
 	saveSession,
 } from "../src/session.js";
 
-const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+const settle = (delay = 100) =>
+	new Promise((resolve) => setTimeout(resolve, delay));
 
 async function providerPath(directory: string, providers: string[]) {
 	const binDirectory = path.join(directory, "bin");
@@ -84,6 +87,7 @@ test("starts a fresh Session with /new and runs a question", async () => {
 		instance.lastFrame() ?? "",
 		/Recommendation for “Should we ship it\?”/,
 	);
+	assert.match(instance.frames.join(""), /YOU[\s\S]*Should we ship it\?/);
 	instance.unmount();
 	await rm(configurationDirectory, { recursive: true, force: true });
 });
@@ -341,6 +345,102 @@ test("does not create configuration when no supported CLI is available", async (
 	);
 	await rm(configurationDirectory, { recursive: true, force: true });
 	instance.unmount();
+});
+
+test("uses responsive scrollback messages and composer completions", async () => {
+	const configurationDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-"),
+	);
+	await createEngineeringCouncil(configurationDirectory, "codex");
+	const instance = render(
+		createElement(App, {
+			workingDirectory: "/tmp/council-workspace",
+			configurationDirectory,
+			availableProviders: ["codex"],
+		}),
+	);
+	await settle();
+
+	instance.stdin.write("/he");
+	await settle();
+	assert.match(instance.lastFrame() ?? "", /Tab to complete: \/help/);
+	instance.stdin.write("\t");
+	await settle();
+	assert.match(instance.lastFrame() ?? "", /\/help /);
+	instance.stdin.write("\r");
+	await settle();
+	assert.match(instance.lastFrame() ?? "", /Commands: \/new, \/resume, \/stop/);
+
+	Object.defineProperty(instance.stdout, "columns", { value: 60 });
+	instance.stdout.emit("resize");
+	await settle();
+	assert.match(
+		instance.lastFrame() ?? "",
+		/COUNCIL ROSTER[\s\S]*MESSAGE THE COUNCIL/,
+	);
+
+	instance.unmount();
+	await rm(configurationDirectory, { recursive: true, force: true });
+});
+
+test("stops an active Deliberation before another one can be saved", async () => {
+	const configurationDirectory = await mkdtemp(
+		path.join(os.tmpdir(), "openagentcouncil-"),
+	);
+	await createEngineeringCouncil(configurationDirectory, "codex");
+	const pending = new Map<string, (content: string) => void>();
+	let slow = true;
+	const instance = render(
+		createElement(App, {
+			workingDirectory: "/tmp/council-workspace",
+			configurationDirectory,
+			availableProviders: ["codex"],
+			adapter: {
+				selectParticipants: deterministicFakeAdapter.selectParticipants,
+				control: deterministicFakeAdapter.control,
+				respond(request) {
+					if (!slow) return deterministicFakeAdapter.respond(request);
+					return new Promise((resolve: (content: string) => void) =>
+						pending.set(request.member.handle, resolve),
+					);
+				},
+			},
+		}),
+	);
+	await settle();
+	instance.stdin.write("/new");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("Stop this Deliberation.");
+	await settle();
+	instance.stdin.write("\r");
+	await settle();
+	instance.stdin.write("/stop");
+	await settle();
+	instance.stdin.write("\r");
+	slow = false;
+	pending.get("researcher")?.("Researcher Position");
+	pending.get("critic")?.("Critic Position");
+	await settle(150);
+	instance.stdin.write("Keep discussing.");
+	await settle();
+	instance.stdin.write("\r");
+	await settle(200);
+
+	const [saved] = await (async () => {
+		const sessions = await loadSessionMetadata(configurationDirectory);
+		return Promise.all(
+			sessions.map((metadata) =>
+				loadSession(configurationDirectory, metadata.id),
+			),
+		);
+	})();
+	assert.equal(saved?.deliberations.length, 1);
+	assert.equal(saved?.deliberations[0]?.question, "Keep discussing.");
+
+	instance.unmount();
+	await rm(configurationDirectory, { recursive: true, force: true });
 });
 
 for (const [name, providers, expected, unexpected] of [
