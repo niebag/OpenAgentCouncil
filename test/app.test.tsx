@@ -5,6 +5,7 @@ import { createElement } from "react";
 import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { App } from "../src/app.js";
 import {
 	createEngineeringCouncil,
@@ -441,22 +442,23 @@ test("uses responsive scrollback messages and composer completions", async () =>
 		}),
 	);
 	await settle();
+	const frame = () => stripVTControlCharacters(instance.lastFrame() ?? "");
 
 	instance.stdin.write("/he");
 	await settle();
-	assert.match(instance.lastFrame() ?? "", /Tab to complete: \/help/);
+	assert.match(frame(), /Tab to complete: \/help/);
 	instance.stdin.write("\t");
 	await settle();
-	assert.match(instance.lastFrame() ?? "", /\/help /);
+	assert.match(frame(), /\/help /);
 	instance.stdin.write("\r");
 	await settle();
-	assert.match(instance.lastFrame() ?? "", /Commands: \/new, \/resume, \/stop/);
+	assert.match(frame(), /Commands: \/new, \/resume, \/stop/);
 
 	Object.defineProperty(instance.stdout, "columns", { value: 60 });
 	instance.stdout.emit("resize");
 	await settle();
 	assert.match(
-		instance.lastFrame() ?? "",
+		frame(),
 		/COUNCIL ROSTER[\s\S]*MESSAGE THE COUNCIL/,
 	);
 
