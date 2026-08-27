@@ -457,10 +457,7 @@ test("uses responsive scrollback messages and composer completions", async () =>
 	Object.defineProperty(instance.stdout, "columns", { value: 60 });
 	instance.stdout.emit("resize");
 	await settle();
-	assert.match(
-		frame(),
-		/COUNCIL ROSTER[\s\S]*MESSAGE THE COUNCIL/,
-	);
+	assert.match(frame(), /COUNCIL ROSTER[\s\S]*MESSAGE THE COUNCIL/);
 
 	instance.unmount();
 	await rm(configurationDirectory, { recursive: true, force: true });
