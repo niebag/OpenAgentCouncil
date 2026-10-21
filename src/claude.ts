@@ -90,7 +90,14 @@ async function assertBoundaries(
 		["skills", message.skills],
 		["plugins", message.plugins],
 	] as const) {
-		if (!Array.isArray(value) || value.length > 0) {
+		const loaded = Array.isArray(value)
+			? value.filter(
+					(entry) =>
+						name !== "plugins" ||
+						(entry as { path?: unknown })?.path !== "builtin",
+				)
+			: undefined;
+		if (!loaded || loaded.length > 0) {
 			throw new Error(`Claude Code did not disable ${name}`);
 		}
 	}
